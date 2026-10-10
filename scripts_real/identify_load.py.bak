@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+Franka 末端负载辨识脚本
+
+通过在多个静态姿态下测量外部关节力矩，使用最小二乘法辨识末端负载的质量和质心位置。
+
+前提条件:
+    1. Franka Desk 中 EE 质量设为 0（让负载重力全部表现为外部力矩）
+    2. Franka Desk 中 Flange-to-TCP 全部设为 0（代码自行处理 TCP 偏移）
+    3. NUC 端 ZeroRPC 服务已包含 get_state_for_identification 接口
+    4. 机器人已解锁
+
+用法:
+    python scripts_real/identify_load.py --robot-ip 172.16.0.3
+"""
+
+import argparse
+import time
+import numpy as np
+import zerorpc
+from scipy.spatial.transform import Rotation
+
+
+# ============ Franka Panda 运动学 ============
+
+# Modified DH parameters (Craig convention) [alpha_{i-1}, a_{i-1}(m), d_i(m)]
+# T_i = Rot_x(alpha_{i-1}) * Trans_x(a_{i-1}) * Rot_z(theta_i) * Trans_z(d_i)
+# Reference: https://frankaemika.github.io/docs/control_parameters.html
+FRANKA_MDH = [
+    # alpha_{i-1},  a_{i-1},   d_i
+    [0,             0,         0.333],     # joint 1
+    [-np.pi/2,      0,         0],         # joint 2
+    [np.pi/2,       0,         0.316],     # joint 3
+    [np.pi/2,       0.0825,    0],         # joint 4
+    [-np.pi/2,     -0.0825,    0.384],     # joint 5
+    [np.pi/2,       0,         0],         # joint 6
+    [np.pi/2,       0.088,     0],         # joint 7
+]
+
+# Flange: d=0.107, alpha=0 (pure z-translation in joint 7 frame)
+FLANGE_D = 0.107
+
+
+def mdh_matrix(theta, d, a_prev, alpha_prev):
+    """Modified DH (Craig convention) transformation matrix.
+
+    T = Rot_x(alpha_{i-1}) * Trans_x(a_{i-1}) * Rot_z(theta_i) * Trans_z(d_i)
+    """
+    ct, st = np.cos(theta), np.sin(theta)
+    ca, sa = np.cos(alpha_prev), np.sin(alpha_prev)
+    return np.array([
+        [ct,       -st,       0,      a_prev],
+        [st * ca,   ct * ca, -sa,    -d * sa],
+        [st * sa,   ct * sa,  ca,     d * ca],
+        [0,         0,        0,      1],
+    ])
+
+
+def franka_fk(q):
+    """Franka Panda forward kinematics (Modified DH, Craig convention).
+
+    Args:
+        q: joint angles (7,)
+
+    Returns:
+        T_flange: 4x4 flange pose in base frame
+        frames: list of 8 frames [base, after_j1, ..., after_j7]
+    """
+    T = np.eye(4)
+    frames = [T.copy()]
+
+    for i in range(7):
+        alpha_prev, a_prev, d = FRANKA_MDH[i]
+        T = T @ mdh_matrix(q[i], d, a_prev, alpha_prev)
+        frames.append(T.copy())
+
+    # Flange transform: alpha=0, a=0, d=0.107, theta=0
+    T_flange = T @ mdh_matrix(0, FLANGE_D, 0, 0)
+
+    return T_flange, frames
+
+
+def franka_jacobian(q):
+    """Compute 6x7 geometric Jacobian for Franka Panda (Modified DH).
+
+    In Modified DH, joint k's Rz(theta_k) acts on the intermediate frame
+    frames[k] * Rx(alpha) * Tx(a). So:
+      - Joint axis = z-axis of (frames[k] rotated by Rx(alpha_prev))
+      - Point on axis = origin of frames[k] shifted by a_prev along x_k
+
+    Returns:
+        J: 6x7 Jacobian (linear velocity on top, angular on bottom)
+        T_flange: 4x4 flange transform
+    """
+    T_flange, frames = franka_fk(q)
+    p_ee = T_flange[:3, 3]
+
+    J = np.zeros((6, 7))
+    for k in range(7):
+        alpha_prev = FRANKA_MDH[k][0]
+        a_prev = FRANKA_MDH[k][1]
+        R_k = frames[k][:3, :3]
+        p_k = frames[k][:3, 3]
+
+        # Joint axis in base frame:
+        # Rx(alpha) * [0,0,1] = [0, -sin(alpha), cos(alpha)]
+        sa = np.sin(alpha_prev)
+        ca = np.cos(alpha_prev)
+        z = R_k @ np.array([0.0, -sa, ca])
+
+        # Point on joint axis (Tx(a) shifts origin along x_k)
+        p_joint = p_k + a_prev * R_k[:, 0]
+
+        J[:3, k] = np.cross(z, p_ee - p_joint)
+        J[3:, k] = z
+
+    return J, T_flange
+
+
+def verify_fk(server, q_actual, ee_pose_reported):
+    """Compare our FK with the robot's reported EE pose."""
+    T_fk, _ = franka_fk(q_actual)
+    pos_fk = T_fk[:3, 3]
+    rot_fk = Rotation.from_matrix(T_fk[:3, :3]).as_rotvec()
+
+    pos_reported = np.array(ee_pose_reported[:3])
+    rot_reported = np.array(ee_pose_reported[3:])
+
+    pos_err = np.linalg.norm(pos_fk - pos_reported)
+    rot_err = np.linalg.norm(rot_fk - rot_reported)
+
+    return pos_err, rot_err, pos_fk, pos_reported
+
+
+# ============ 数据采集 ============
+
+def collect_data(server, configs, settle_time=3.0, move_time=5.0, samples=50):
+    """Move to each configuration and collect torque data.
+
+    Args:
+        server: ZeroRPC client
+        configs: list of 7D joint configurations
+        settle_time: time to wait after reaching pose (s)
+        move_time: duration for each joint move (s)
+        samples: number of torque samples to average
+    """
+    data = []
+
+    for idx, q_target in enumerate(configs):
+        print(f"\n{'─' * 50}")
+        print(f"Configuration {idx + 1}/{len(configs)}")
+        print(f"Target joints (deg): {np.round(np.degrees(q_target), 1)}")
+
+        # Move to configuration
+        server.move_to_joint_positions(q_target.tolist(), float(move_time))
+        print(f"Moving... waiting {move_time + settle_time:.0f}s")
+        time.sleep(move_time + settle_time)
+
+        # Collect multiple samples and average
+        torques_list = []
+        for _ in range(samples):
+            state = server.get_state_for_identification()
+            torques_list.append(np.array(state['motor_torques_external']))
+            time.sleep(0.01)
+
+        avg_torques = np.mean(torques_list, axis=0)
+        std_torques = np.std(torques_list, axis=0)
+
+        q_actual = np.array(state['joint_positions'])
+        ee_pose = np.array(state['ee_pose'])
+
+        # Verify FK
+        pos_err, rot_err, pos_fk, pos_real = verify_fk(
+            server, q_actual, ee_pose)
+
+        print(f"Actual joints (deg):  {np.round(np.degrees(q_actual), 1)}")
+        print(f"EE pos (robot):       {np.round(pos_real, 4)}")
+        print(f"EE pos (FK):          {np.round(pos_fk, 4)}")
+        print(f"FK error:             pos={pos_err * 1000:.1f}mm  rot={rot_err:.4f}rad")
+        print(f"Ext torques (avg):    {np.round(avg_torques, 3)}")
+        print(f"Ext torques (std):    {np.round(std_torques, 4)}")
+
+        if pos_err > 0.01:  # 10mm threshold
+            print(f"WARNING: FK position error > 10mm! Results may be inaccurate.")
+
+        data.append({
+            'q': q_actual,
+            'ee_pose': ee_pose,
+            'tau_ext': avg_torques,
+            'tau_std': std_torques,
+            'fk_pos_err': pos_err,
+        })
+
+    return data
+
+
+# ============ 负载辨识 ============
+
+def identify_load(data):
+    """Solve for load parameters using least squares.
+
+    At static equilibrium with EE load set to 0:
+        tau_ext = J^T * W_gravity
+
+    where W_gravity = [fx, fy, fz, tau_x, tau_y, tau_z] in base frame.
+
+    Gravity wrench for load with mass m and CoM [cx, cy, cz] in flange frame:
+        force  = [0, 0, -mg]
+        torque = (R_ee * [cx, cy, cz]) × [0, 0, -mg]
+
+    This is linear in phi = [m, m*cx, m*cy, m*cz], giving:
+        tau_ext = J^T * M(R_ee) * phi
+
+    Stacking over N configurations → least squares.
+    """
+    g = 9.81
+
+    A_rows = []
+    b_rows = []
+
+    for d in data:
+        q = d['q']
+        tau_ext = d['tau_ext']
+
+        J, T_ee = franka_jacobian(q)
+        R_ee = T_ee[:3, :3]
+
+        # Build 6x4 matrix M such that W_gravity = M * phi
+        # where phi = [m, m*cx, m*cy, m*cz]
+        #
+        # W = [0, 0, -g*m, -g*(R[1,:]*[m*cx, m*cy, m*cz]), g*(R[0,:]*[m*cx, m*cy, m*cz]), 0]
+        M = np.zeros((6, 4))
+        M[2, 0] = -g                          # fz = -g * m
+        M[3, 1] = -g * R_ee[1, 0]             # tau_x = -g * (R[1,0]*m*cx + ...)
+        M[3, 2] = -g * R_ee[1, 1]
+        M[3, 3] = -g * R_ee[1, 2]
+        M[4, 1] = g * R_ee[0, 0]              # tau_y = g * (R[0,0]*m*cx + ...)
+        M[4, 2] = g * R_ee[0, 1]
+        M[4, 3] = g * R_ee[0, 2]
+
+        # tau_ext = J^T * M * phi  →  (J^T * M) * phi = tau_ext
+        A_rows.append(J.T @ M)   # 7x4
+        b_rows.append(tau_ext)    # 7
+
+    A = np.vstack(A_rows)          # (7*N) x 4
+    b = np.concatenate(b_rows)     # 7*N
+
+    # Solve: A * phi = b
+    phi, residuals, rank, sv = np.linalg.lstsq(A, b, rcond=None)
+
+    m = phi[0]
+    if abs(m) < 0.01:
+        print("WARNING: Estimated mass near zero! Check that EE mass=0 in Franka Desk.")
+        cx, cy, cz = 0, 0, 0
+    else:
+        cx = phi[1] / m
+        cy = phi[2] / m
+        cz = phi[3] / m
+
+    # Compute residual norm
+    residual_norm = np.linalg.norm(A @ phi - b)
+
+    return m, cx, cy, cz, phi, residual_norm, rank
+
+
+# ============ 主函数 ============
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Franka End-Effector Load Identification')
+    parser.add_argument('--robot-ip', type=str, default='172.16.13.170',
+                        help='Robot ZeroRPC server IP')
+    parser.add_argument('--robot-port', type=int, default=4242,
+                        help='Robot ZeroRPC server port')
+    parser.add_argument('--settle-time', type=float, default=3.0,
+                        help='Wait time after reaching pose (seconds)')
+    parser.add_argument('--move-time', type=float, default=5.0,
+                        help='Duration for each joint move (seconds)')
+    parser.add_argument('--samples', type=int, default=100,
+                        help='Number of torque samples to average at each pose')
+    args = parser.parse_args()
+
+    # Define calibration joint configurations (radians)
+    # These provide different EE orientations for CoM identification.
+    # Joint limits: q1[-2.9,2.9] q2[-1.76,1.76] q3[-2.9,2.9]
+    #               q4[-3.07,-0.07] q5[-2.9,2.9] q6[-0.02,3.75] q7[-2.9,2.9]
+    # configs = [
+    #     # Config 1: Standard home-like (tool roughly pointing down)
+    #     np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785]),
+    #     # Config 2: Rotate base joint
+    #     np.array([0.5, -0.785, 0, -2.356, 0, 1.571, 0.785]),
+    #     # Config 3: Different elbow angle
+    #     np.array([0, -0.4, 0, -1.8, 0, 1.571, 0.785]),
+    #     # Config 4: Wrist tilt (joint 5, 6 changed)
+    #     np.array([0, -0.785, 0, -2.356, 0.5, 1.2, 0.785]),
+    #     # Config 5: Combined rotation
+    #     np.array([-0.5, -0.3, 0.3, -2.0, -0.3, 1.8, 0.785]),
+    #     # Config 6: Another wrist orientation
+    #     np.array([0.3, -0.6, -0.3, -1.5, 0.3, 2.0, 0.785]),
+    # ]
+    
+    configs = [
+        # Config 1: Standard home-like (tool roughly pointing down)
+        np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.0]),
+        # Config 2: Rotate base joint
+        np.array([0.5, -0.785, 0, -2.356, 0, 1.571, 0.0]),
+        # Config 3: Different elbow angle
+        np.array([0, -0.4, 0, -1.8, 0, 1.571, 0.0]),
+        # Config 4: Wrist tilt (joint 5, 6 changed)
+        np.array([0, -0.785, 0, -2.356, 0.5, 1.2, 0.0]),
+        # Config 5: Combined rotation
+        np.array([-0.5, -0.3, 0.3, -2.0, -0.3, 1.8, 0.0]),
+        # Config 6: Another wrist orientation
+        np.array([0.3, -0.6, -0.3, -1.5, 0.3, 2.0, 0.0]),
+    ]
+
+    # Connect
+    print("=" * 60)
+    print("Franka End-Effector Load Identification")
+    print("=" * 60)
+
+    server = zerorpc.Client(heartbeat=20)
+    server.connect(f"tcp://{args.robot_ip}:{args.robot_port}")
+    print(f"Connected to {args.robot_ip}:{args.robot_port}")
+    print(f"Configurations: {len(configs)}")
+    print(f"Settle time: {args.settle_time}s, Move time: {args.move_time}s")
+    print(f"Samples per config: {args.samples}")
+    print()
+    print("IMPORTANT: Franka Desk 中确保:")
+    print("  - EE mass = 0")
+    print("  - Flange-to-TCP = identity")
+    print("=" * 60)
+
+    input("\nPress Enter to start (robot will move!)... ")
+
+    # Quick FK verification at current position
+    print("\nVerifying FK at current position...")
+    state = server.get_state_for_identification()
+    q_curr = np.array(state['joint_positions'])
+    ee_curr = np.array(state['ee_pose'])
+    pos_err, rot_err, _, _ = verify_fk(server, q_curr, ee_curr)
+    print(f"FK error: pos={pos_err * 1000:.1f}mm, rot={rot_err:.4f}rad")
+
+    if pos_err > 0.01:
+        print("\nWARNING: FK error > 10mm!")
+        print("Possible causes:")
+        print("  - Franka Desk EE frame not set to identity")
+        print("  - DH parameters mismatch")
+        resp = input("Continue anyway? [y/N]: ")
+        if resp.lower() != 'y':
+            server.close()
+            return
+
+    # Collect data
+    print("\nStarting data collection...")
+    data = collect_data(
+        server, configs,
+        settle_time=args.settle_time,
+        move_time=args.move_time,
+        samples=args.samples,
+    )
+
+    # Solve
+    print(f"\n{'=' * 60}")
+    print("Solving for load parameters...")
+    print("=" * 60)
+
+    m, cx, cy, cz, phi, residual_norm, rank = identify_load(data)
+
+    print(f"\n{'=' * 60}")
+    print("RESULTS")
+    print(f"{'=' * 60}")
+    print(f"  Mass:          {m:.4f} kg")
+    print(f"  CoM (flange frame):")
+    print(f"    cx:          {cx:.4f} m  ({cx * 1000:.1f} mm)")
+    print(f"    cy:          {cy:.4f} m  ({cy * 1000:.1f} mm)")
+    print(f"    cz:          {cz:.4f} m  ({cz * 1000:.1f} mm)")
+    print(f"  Residual norm: {residual_norm:.4f}")
+    print(f"  Matrix rank:   {rank}")
+    print(f"\n  → Franka Desk Settings:")
+    print(f"    Mass:    {m:.3f} kg")
+    print(f"    F_x_Cee: [{cx:.4f}, {cy:.4f}, {cz:.4f}]")
+    print(f"{'=' * 60}")
+
+    # Move back to home
+    print("\nMoving back to home position...")
+    q_home = configs[0]
+    server.move_to_joint_positions(q_home.tolist(), float(args.move_time))
+    time.sleep(args.move_time + 1)
+
+    server.close()
+    print("Done!")
+
+
+if __name__ == '__main__':
+    main()

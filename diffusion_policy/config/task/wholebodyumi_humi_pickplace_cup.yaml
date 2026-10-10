@@ -1,0 +1,42 @@
+name: wholebodyumi_humi_pickplace_cup
+
+dataset_path: ${oc.env:WHOLEBODYUMI_DATASET_PATH,/path/to/pickplace-cup-04-03.zarr.zip}
+img_obs_horizon: 1
+low_dim_obs_horizon: 3
+action_horizon: 48
+
+shape_meta: &shape_meta
+  obs:
+    left_fisheye_img:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon}
+      type: rgb
+    right_fisheye_img:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon}
+      type: rgb
+    lower_body_dof:
+      shape: [15]
+      horizon: ${task.low_dim_obs_horizon}
+      type: low_dim
+  action:
+    shape: [50]
+    horizon: ${task.action_horizon}
+    rotation_rep: rotation_6d
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.wholebodyumi_humi_image_dataset.WholeBodyUmiHumiImageDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  target_key: target
+  proprio_key: lower_body_dof
+  crop_size: 224
+  relative_action: True
+  predict_next_step: True
+  left_gripper_keypoint_index: 3
+  right_gripper_keypoint_index: 4
+  seed: 42
+  val_ratio: 0.05

@@ -1,0 +1,9 @@
+root@job-a64d1f2b-3514-4db1-b387-5e18a0593d42-worker-0:/share/project/dcw/projects/openpi# .venv/bin/python scripts/serve_policy.py \
+  --port=8099
+  policy:checkpoint \
+  --policy.config=pi05_umi_lift_bottle \
+  --policy.dir=/share/project/dcw/projects/openpi/checkpoints/pi05_umi_lift_bottle/lift_bottle_lora/19999
+INFO:openpi.shared.download:Downloading gs://openpi-assets/checkpoints/pi0_aloha_sim to /share/project/dcw/projects/openpi/.openpi_cache/openpi-assets/checkpoints/pi0_aloha_sim
+WARNING:openpi.shared.download:gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly.
+ 88%|▉| 9.83G/11.2G [11:06<28:06, 868kiB/s]
+

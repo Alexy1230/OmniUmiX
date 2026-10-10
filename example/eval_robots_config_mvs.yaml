@@ -1,0 +1,70 @@
+{
+  # Direct MVS USB camera; adjust serial for your unit.
+  "cameras": [
+    {
+      "backend": "mvs", "serial": "DA9057815",
+      # DA9057798
+      # DA9057815
+      "width": 480, "height": 480, "fps": 30,
+      "rotate_180": true,
+      "exposure_time": 5000.0,
+      "enable_auto_gain": true, "enable_auto_white_balance": true,
+      "black_level_enable": true, "black_level": 240, "brightness": 40,
+      # Software ROI: offset_x/offset_y are CENTER coordinates AFTER rotation, matching calibration fisheye_crop.
+      "sensor_roi": {"enabled": true, "offset_x": 683.8753662109375, "offset_y": 505.6080017089844, "width": 1080, "height": 1080},
+      # Host receipt timestamp minus this delay; calibrate for this computer/camera.
+      "receive_latency": 0.0,
+      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+      "sdk_runtime": "/opt/MVS/lib",
+      "launch_timeout": 15, "frame_timeout_ms": 1000,
+      "recording_codec": "libx264"
+    }
+  ],
+  # robot configurations, 0->right 1->left
+  # comment out robot #1 if only using 1 arm
+  "robots": [
+    {
+      "robot_type": "franka",
+      "robot_ip": "172.16.0.1",
+      "robot_obs_latency": 0.0001, "robot_action_latency": 0.1, "tcp_offset": 0.235,
+      # table height for finger-table collision avoidance
+      # -inf to disable
+      "height_threshold": -1,
+      # sphere collision primitive size and location for inter-gripper collision avoidance
+      # 0 to disable
+      "sphere_radius": 0.1, "sphere_center": [0, -0.06, -0.185],
+      "joints_init": [0.00010400846076663584, -0.24481917917728424, -0.0936817154288292, -2.7792861461639404, -0.0670328289270401, 1.998847246170044, 0.7243571877479553]
+    },
+    # {
+    #   "robot_type": "ur5",
+    #   "robot_ip": "192.168.0.9",
+    #   "robot_obs_latency": 0.0001, "robot_action_latency": 0.1, "tcp_offset": 0.235,
+    #   "height_threshold": 0.022,
+    #   "sphere_radius": 0.1, "sphere_center": [0, -0.06, -0.185]
+    # }
+  ],
+  # gripper configurations, 0->right 1->left
+  "grippers": [
+    {
+      "gripper_type": "custom",  # Use custom gripper (gripper_controller_1_14.py)
+      "port1": "/dev/ttyUSB1",   # Serial port for motor 1
+      "motor1_id": 2,            # Motor 1 ID
+      "mode": "single",          # "single" or "dual"
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    },
+    # For WSG50 gripper (alternative):
+    # {
+    #   "gripper_type": "wsg",
+    #   "gripper_ip": "192.168.0.18",
+    #   "gripper_port": 1000, "gripper_obs_latency": 0.01, "gripper_action_latency": 0.1
+    # }
+  ],
+  # transformation right arm's base frame in left arm's base coordinate frame
+  "tx_left_right": [
+    [ 0.99996206,  0.00661996,  0.00566226, -0.01676012],
+    [-0.00663261,  0.99997554,  0.0022186 , -0.60552492],
+    [-0.00564743, -0.00225607,  0.99998151, -0.007277  ],
+    [ 0.        ,  0.        ,  0.        ,  1.        ]
+  ]
+}
