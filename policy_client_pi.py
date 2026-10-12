@@ -1,36 +1,6 @@
-"""
-UMI PI05 Policy Client - MVS camera, custom serial gripper, OpenPI inference
+"""OpenPI PC client for one or two Frankas, each served by its own NUC.
 
-参考 eval_real.py 实现，使用 BimanualUmiEnv 环境
-
-Usage:
-    python umi_policy_client.py \
-        --server-url http://<服务器IP>:8099 \
-        --robot-config example/eval_robots_config.yaml \
-        --output data_local/eval_output
-
-架构：
-    本地机器                                     服务器
-    ┌─────────────────────────┐                ┌──────────────────┐
-    │ BimanualUmiEnv          │                │                  │
-    │   └─ 机器人/夹爪/相机   │                │  策略推理服务     │
-    │                         │                │  (端口 8099)     │
-    │ umi_policy_client.py    │ ──HTTP请求──▶  │                  │
-    │   └─ 获取obs → 发送     │ ◀──返回动作──  │                  │
-    │   └─ 执行动作           │                │                  │
-    └─────────────────────────┘                └──────────────────┘
-
-
-    cd /share/project/dcw/projects/openpi
-
-export OPENPI_DATA_HOME=/share/project/dcw/projects/openpi/.openpi_cache
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
-
-.venv/bin/python scripts/serve_policy.py \
-  --port=8099 \
-  policy:checkpoint \
-  --policy.config=pi05_umi_lift_bottle \
-  --policy.dir=/share/project/dcw/projects/openpi/checkpoints/pi05_umi_lift_bottle/lift_bottle_lora/19999
+See docs/bimanual_franka_client.md for model contract, setup and episode controls.
 """
 import os
 import sys
@@ -42,7 +12,6 @@ import click
 import cv2
 import numpy as np
 import scipy.spatial.transform as st
-from websockets.sync.client import connect
 from multiprocessing.managers import SharedMemoryManager
 
 # 限制线程数
@@ -58,20 +27,64 @@ from umi.real_world.bimanual_umi_env import BimanualUmiEnv
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
 from umi.common.precise_sleep import precise_wait
 from umi.common.pose_util import pose_to_mat, mat_to_pose
-from reactive_diffusion_policy.common.space_utils import (
-    ortho6d_to_rotation_matrix,
-    pose_6d_to_pose_9d,
+from umi.real_world.bimanual_policy import (
+    PolicyClient, policy_options, validate_hardware_config,
+    gripper_scales, build_observation, decode_actions, average_actions,
 )
-from reactive_diffusion_policy.common.action_utils import (
-    relative_actions_to_absolute_actions,
-)
-from umi.common import openpi_msgpack_numpy
-from scipy.spatial.transform import Rotation as R
 
 # # 尝试导入 json_numpy
 # json_numpy = None
 # USE_JSON_NUMPY = True
 # ============ 坐标转换函数 ============
+
+def solve_table_collision(ee_pose, gripper_width, height_threshold):
+    """检测并解决与桌面的碰撞"""
+    finger_thickness = 25.5 / 1000
+    keypoints = list()
+    for dx in [-1, 1]:
+        for dy in [-1, 1]:
+            keypoints.append((dx * gripper_width / 2, dy * finger_thickness / 2, 0))
+    keypoints = np.asarray(keypoints)
+    rot_mat = st.Rotation.from_rotvec(ee_pose[3:6]).as_matrix()
+    transformed_keypoints = np.transpose(rot_mat @ np.transpose(keypoints)) + ee_pose[:3]
+    delta = max(height_threshold - np.min(transformed_keypoints[:, 2]), 0)
+    ee_pose[2] += delta
+
+def solve_sphere_collision(ee_poses, robots_config):
+    """检测并解决两个机械臂之间的碰撞"""
+    num_robot = len(robots_config)
+    this_that_mat = np.identity(4)
+    this_that_mat[:3, 3] = np.array([0, 0.89, 0])  # Left base expressed in right base; adjust for your installation.
+
+    for this_robot_idx in range(num_robot):
+        for that_robot_idx in range(this_robot_idx + 1, num_robot):
+            this_ee_mat = pose_to_mat(ee_poses[this_robot_idx][:6])
+            this_sphere_mat_local = np.identity(4)
+            this_sphere_mat_local[:3, 3] = np.asarray(robots_config[this_robot_idx]['sphere_center'])
+            this_sphere_mat_global = this_ee_mat @ this_sphere_mat_local
+            this_sphere_center = this_sphere_mat_global[:3, 3]
+
+            that_ee_mat = pose_to_mat(ee_poses[that_robot_idx][:6])
+            that_sphere_mat_local = np.identity(4)
+            that_sphere_mat_local[:3, 3] = np.asarray(robots_config[that_robot_idx]['sphere_center'])
+            that_sphere_mat_global = this_that_mat @ that_ee_mat @ that_sphere_mat_local
+            that_sphere_center = that_sphere_mat_global[:3, 3]
+
+            distance = np.linalg.norm(that_sphere_center - this_sphere_center)
+            threshold = robots_config[this_robot_idx]['sphere_radius'] + robots_config[that_robot_idx]['sphere_radius']
+
+            if distance < threshold:
+                if distance < 1e-8:
+                    raise ValueError('Gripper sphere centers coincide; cannot choose an avoidance direction')
+                print('avoid collision between two arms')
+                half_delta = (threshold - distance) / 2
+                normal = (that_sphere_center - this_sphere_center) / distance
+                this_sphere_mat_global[:3, 3] -= half_delta * normal
+                that_sphere_mat_global[:3, 3] += half_delta * normal
+
+                ee_poses[this_robot_idx][:6] = mat_to_pose(this_sphere_mat_global @ np.linalg.inv(this_sphere_mat_local))
+                ee_poses[that_robot_idx][:6] = mat_to_pose(np.linalg.inv(this_that_mat) @ that_sphere_mat_global @ np.linalg.inv(that_sphere_mat_local))
+
 
 def axis_angle_to_rpy(axis_angle: np.ndarray) -> np.ndarray:
     """Convert axis-angle to RPY (euler angles xyz order)."""
@@ -95,116 +108,20 @@ def rpy_to_axis_angle(rpy: np.ndarray) -> np.ndarray:
     return np.array(axis_angles).reshape(*original_shape, 3)
 
 
-# ============ 碰撞检测函数 (来自 eval_real.py) ============
-
-def solve_table_collision(ee_pose, gripper_width, height_threshold):
-    """检测并解决与桌面的碰撞"""
-    finger_thickness = 25.5 / 1000
-    keypoints = list()
-    for dx in [-1, 1]:
-        for dy in [-1, 1]:
-            keypoints.append((dx * gripper_width / 2, dy * finger_thickness / 2, 0))
-    keypoints = np.asarray(keypoints)
-    rot_mat = st.Rotation.from_rotvec(ee_pose[3:6]).as_matrix()
-    transformed_keypoints = np.transpose(rot_mat @ np.transpose(keypoints)) + ee_pose[:3]
-    delta = max(height_threshold - np.min(transformed_keypoints[:, 2]), 0)
-    ee_pose[2] += delta
-
-
-def solve_sphere_collision(ee_poses, robots_config):
-    """检测并解决两个机械臂之间的碰撞"""
-    num_robot = len(robots_config)
-    this_that_mat = np.identity(4)
-    this_that_mat[:3, 3] = np.array([0, 0.89, 0])  # TODO: 根据实际情况调整
-
-    for this_robot_idx in range(num_robot):
-        for that_robot_idx in range(this_robot_idx + 1, num_robot):
-            this_ee_mat = pose_to_mat(ee_poses[this_robot_idx][:6])
-            this_sphere_mat_local = np.identity(4)
-            this_sphere_mat_local[:3, 3] = np.asarray(robots_config[this_robot_idx]['sphere_center'])
-            this_sphere_mat_global = this_ee_mat @ this_sphere_mat_local
-            this_sphere_center = this_sphere_mat_global[:3, 3]
-
-            that_ee_mat = pose_to_mat(ee_poses[that_robot_idx][:6])
-            that_sphere_mat_local = np.identity(4)
-            that_sphere_mat_local[:3, 3] = np.asarray(robots_config[that_robot_idx]['sphere_center'])
-            that_sphere_mat_global = this_that_mat @ that_ee_mat @ that_sphere_mat_local
-            that_sphere_center = that_sphere_mat_global[:3, 3]
-
-            distance = np.linalg.norm(that_sphere_center - this_sphere_center)
-            threshold = robots_config[this_robot_idx]['sphere_radius'] + robots_config[that_robot_idx]['sphere_radius']
-
-            if distance < threshold:
-                print('avoid collision between two arms')
-                half_delta = (threshold - distance) / 2
-                normal = (that_sphere_center - this_sphere_center) / distance
-                this_sphere_mat_global[:3, 3] -= half_delta * normal
-                that_sphere_mat_global[:3, 3] += half_delta * normal
-
-                ee_poses[this_robot_idx][:6] = mat_to_pose(this_sphere_mat_global @ np.linalg.inv(this_sphere_mat_local))
-                ee_poses[that_robot_idx][:6] = mat_to_pose(np.linalg.inv(this_that_mat) @ that_sphere_mat_global @ np.linalg.inv(that_sphere_mat_local))
-
-
-# ============ 策略客户端类 ============
-
-class PolicyClient:
-    """OpenPI WebSocket transport with NumPy-aware MessagePack."""
-
-    def __init__(self, server_url: str, prompt: str, timeout: float = 60.0):
-        if server_url.startswith(('http://', 'https://')):
-            raise ValueError("PI05 client requires ws:// or wss://, not the HTTP /dp URL")
-        if not server_url.startswith(('ws://', 'wss://')):
-            server_url = f'ws://{server_url}'
-        self.server_url = server_url.rstrip('/')
-        self.prompt = prompt
-        self.timeout = timeout
-        self.packer = openpi_msgpack_numpy.Packer()
-        self.ws = connect(
-            self.server_url,
-            open_timeout=timeout,
-            close_timeout=min(timeout, 5.0),
-            compression=None,
-            max_size=None,
-        )
-        metadata_message = self.ws.recv(timeout=timeout)
-        self.metadata = openpi_msgpack_numpy.unpackb(metadata_message)
-        keys = list(self.metadata) if isinstance(self.metadata, dict) else type(self.metadata).__name__
-        print(f"OpenPI connected; metadata keys: {keys}")
-
-    def close(self):
-        if self.ws is not None:
-            self.ws.close()
-            self.ws = None
-
-    def call_server(self, image: np.ndarray, state: np.ndarray) -> np.ndarray:
-        payload = {
-            'observation/image': np.asarray(image, dtype=np.uint8),
-            'current_tcp_pose9_gripper': np.asarray(state, dtype=np.float32),
-            'prompt': self.prompt,
-        }
-        try:
-            self.ws.send(self.packer.pack(payload))
-            message = self.ws.recv(timeout=self.timeout)
-            if isinstance(message, str):
-                raise RuntimeError(f"OpenPI server error: {message}")
-            result = openpi_msgpack_numpy.unpackb(message)
-
-            # ==============================================================================================
-            raw_action = result.get('actions', result.get('action')) if isinstance(result, dict) else result
-            # ==============================================================================================
-
-            action = np.asarray(raw_action, dtype=np.float32)
-            if action.ndim == 1:
-                action = action[None]
-            if action.ndim != 2 or action.shape[1] != 10:
-                raise ValueError(f"Expected PI05 actions shaped [T, 10], got {action.shape}")
-            if not np.all(np.isfinite(action)):
-                raise ValueError("PI05 returned non-finite actions")
-            return action
-        except Exception as e:
-            print(f"[PolicyClient] Server error: {e}")
-            return None
-
+def finish_episode_recording(env):
+    """Avoid the environment's timestamps[-1] on a trial with no actions."""
+    if env.obs_accumulator is None:
+        return
+    actions = env.action_accumulator
+    obs_times = env.obs_accumulator.timestamps
+    if (actions is None or len(actions.timestamps) == 0
+            or not obs_times or any(len(t) == 0 for t in obs_times.values())):
+        env.camera.stop_recording()
+        env.obs_accumulator = None
+        env.action_accumulator = None
+        print('[Episode] No complete observation/action samples; replay entry skipped.', flush=True)
+        return
+    env.end_episode()
 
 # ============ 主函数 ============
 
@@ -219,7 +136,7 @@ class PolicyClient:
 @click.option('--save-policy-data', is_flag=True, help='Save exact request image/state and returned actions; does not disable motion.')
 @click.option('--debug-actions', is_flag=True, help='Inspect and log predictions; do not submit policy actions or request homing/initial gripper movement. Controllers still start.')
 @click.option('--init-joints', '-j', is_flag=True, default=False, help='Initialize robot to home position')
-@click.option('--steps-per-inference', '-si', default=1, type=int, help='Action horizon for inference')
+@click.option('--steps-per-inference', '-si', default=1, type=int, help='Submit a new chunk every N loop iterations; inference still runs each iteration')
 @click.option('--max-duration', '-md', default=2000000, type=float, help='Max duration per episode (seconds)')
 @click.option('--max-timesteps', '-mt', default=500, type=int, help='Max steps per episode')
 @click.option('--frequency', '-f', default=None, type=float, help='Control frequency; defaults to policy.control_fps')
@@ -249,39 +166,60 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     obs_image_resolution = obs_image_resolution or int(policy_config.get('image_resolution', 240))
     exec_horizon_steps = exec_horizon_steps or int(policy_config.get('exec_horizon_steps', 32))
     action_is_relative = bool(policy_config.get('action_is_relative', True))
-    hardware_to_model_gripper_scale = float(
-        policy_config.get('hardware_to_model_gripper_scale', 1000.0 / 30.0)
-    )
-    model_to_hardware_gripper_scale = float(
-        policy_config.get('model_to_hardware_gripper_scale', 30.0 / 1000.0)
-    )
-    dt = 1 / frequency
+    hardware_to_model_gripper_scale = policy_config.get('hardware_to_model_gripper_scale', 1000.0 / 30.0)
+    model_to_hardware_gripper_scale = policy_config.get('model_to_hardware_gripper_scale', 30.0 / 1000.0)
     obs_res = (obs_image_resolution, obs_image_resolution)
-    tx_left_right = np.array(robot_config_data.get('tx_left_right', np.eye(4)))
-    tx_robot1_robot0 = tx_left_right
 
     robots_config = robot_config_data['robots']
     grippers_config = robot_config_data['grippers']
     cameras_config = robot_config_data.get('cameras')
     num_robots = len(robots_config)
-    if num_robots != 1:
-        raise ValueError("This PI05 adapter expects one robot and a 10D action checkpoint")
+    validate_hardware_config(robots_config, grippers_config)
+    if any(rc['robot_type'] != 'franka' for rc in robots_config):
+        raise click.UsageError('This PI05 client supports one or two Frankas')
+    options = policy_options(policy_config, num_robots)
+    hardware_to_model_gripper_scale = gripper_scales(hardware_to_model_gripper_scale, num_robots)
+    model_to_hardware_gripper_scale = gripper_scales(model_to_hardware_gripper_scale, num_robots)
+    if (not np.isfinite(frequency) or frequency <= 0 or steps_per_inference <= 0
+            or exec_horizon_steps <= 0 or exec_horizon_steps > 256 or max_timesteps <= 0
+            or not np.isfinite(max_duration) or max_duration <= 0 or ensemble_steps <= 0):
+        raise click.UsageError('Use positive frequency/steps/duration; exec-horizon-steps must be at most 256')
+    dt = 1 / frequency
+    for i, (rc, gc) in enumerate(zip(robots_config, grippers_config)):
+        if rc.get('joints_init') is not None:
+            joints = np.asarray(rc['joints_init'], dtype=float)
+            duration = float(rc.get('joints_init_duration', 5.0))
+            if joints.shape != (7,) or not np.isfinite(joints).all() or not np.isfinite(duration) or duration <= 0:
+                raise click.UsageError(f'robot{i}: joints_init needs seven finite radians and positive duration')
+        if 'initial_position' in gc:
+            width = float(gc['initial_position'])
+            if not np.isfinite(width) or not 0 <= width <= 0.20:
+                raise click.UsageError(f'gripper{i}: initial_position must be metres within [0, 0.20]')
     if camera_reorder is None:
-        camera_indices = None if cameras_config is not None else [0]
+        camera_indices = None if cameras_config is not None else list(range(num_robots))
     else:
         camera_indices = [int(x) for x in camera_reorder.split(',')]
+
+    if cameras_config is not None:
+        selected = list(range(len(cameras_config))) if camera_indices is None else camera_indices
+        if len(selected) < num_robots or len(set(selected)) != len(selected) or any(i < 0 or i >= len(cameras_config) for i in selected):
+            raise click.UsageError('Provide one distinct wrist camera per robot, in robot order')
+    print(f'Model contract: {options}')
 
     print("=" * 60)
     print("UMI Policy Client (No ROS)")
     print("=" * 60)
     print(f"Server URL: {server_url}")
     print(f"Number of robots: {num_robots}")
+    for i, rc in enumerate(robots_config):
+        print(f"Robot {i} endpoint: {rc['robot_ip']}:{int(rc.get('robot_port', 4242))}")
     print(f"Control frequency: {frequency} Hz")
     print(f"Steps per inference: {steps_per_inference}")
     print("=" * 60)
 
     # 创建策略客户端
-    policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout)
+    policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout,
+                                 num_robots=num_robots, policy_config=policy_config)
     atexit.register(policy_client.close)
     capture_dir = None
     capture_idx = 0
@@ -298,15 +236,15 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 frequency=frequency, exec_horizon_steps=exec_horizon_steps,
                 steps_per_inference=steps_per_inference, debug_actions=debug_actions,
                 image_resolution=obs_image_resolution,
-                hardware_to_model_gripper_scale=hardware_to_model_gripper_scale,
-                model_to_hardware_gripper_scale=model_to_hardware_gripper_scale,
+                hardware_to_model_gripper_scale=hardware_to_model_gripper_scale.tolist(),
+                model_to_hardware_gripper_scale=model_to_hardware_gripper_scale.tolist(),
             ), capture_file, indent=2, default=str)
     debug_path = os.path.join(os.path.expanduser(output), 'action_debug.jsonl')
     if debug_actions:
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
         print(f"Action diagnostics: {debug_path}")
         print(f"Server metadata: {policy_client.metadata}")
-        print(f"Configured relative actions: {action_is_relative}; TCP transform: {robots_config[0].get('tx_flange_tcp')}")
+        print(f"Configured relative actions: {action_is_relative}; TCP transform: {[rc.get('tx_flange_tcp') for rc in robots_config]}")
 
     # 设置下采样步数（默认值）
     down_sample_steps = 1
@@ -347,11 +285,13 @@ def main(server_url, prompt, request_timeout, output, robot_config,
             time.sleep(1.0)
 
             # ========== 机器人初始化 ==========
-            if not debug_actions and 'initial_position' in grippers_config[0]:
-                env.gripper_controller.move_gripper(
-                    width_m=float(grippers_config[0]['initial_position']),
-                    force_limit_nm=float(grippers_config[0].get('force_limit_nm', 1.5)),
-                )
+            if not debug_actions:
+                for i, gc in enumerate(grippers_config):
+                    if 'initial_position' in gc:
+                        if gc.get('gripper_type', 'wsg') == 'custom':
+                            env.grippers[i].move_gripper(width_m=float(gc['initial_position']), force_limit_nm=float(gc.get('force_limit_nm', 1.5)))
+                        else:
+                            env.grippers[i].schedule_waypoint(pos=float(gc['initial_position']), target_time=time.time() + 0.5)
                 time.sleep(1.5)
 
             if init_joints:
@@ -390,7 +330,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                     for key_stroke in press_events:
                         if key_stroke == KeyCode(char='q'):
                             print("Exiting...")
-                            env.end_episode()
+                            finish_episode_recording(env)
                             return
                         elif key_stroke == KeyCode(char='c'):
                             start_policy = True
@@ -437,58 +377,31 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                         obs_timestamps = obs['timestamp']
                         print(f'Obs latency: {time.time() - obs_timestamps[-1]:.3f}s')
 
-                        image = cv2.resize(
-                            obs['camera0_rgb'][-1],
-                            (obs_image_resolution, obs_image_resolution),
-                            interpolation=cv2.INTER_AREA,
-                        ).astype(np.uint8, copy=False)
+                        images, current_state, current_poses6, current_widths = build_observation(
+                            obs, num_robots, obs_image_resolution,
+                            hardware_to_model_gripper_scale, options)
 
-                        # absolute [x, y, z, rot_vec]
-                        current_pose6 = np.concatenate([
-                            obs['robot0_eef_pos'][-1],
-                            obs['robot0_eef_rot_axis_angle'][-1],
-                        ])
-                        current_rotmat = st.Rotation.from_rotvec(
-                            current_pose6[3:6]
-                        ).as_matrix()
-
-                        # absolute [x, y, z, rx1, rx2, rx3, ry1, ry2, ry3]
-                        current_pose9 = np.concatenate([
-                            current_pose6[:3],
-                            current_rotmat[:,:2].T.reshape(6),
-                        ])
-                        # current_pose9 = pose_6d_to_pose_9d(current_pose6)
-                        current_gripper = np.asarray(
-                            obs['robot0_gripper_width'][-1], dtype=np.float32
-                        ).reshape(-1)[:1] * hardware_to_model_gripper_scale
-                        current_state = np.concatenate(
-                            [current_pose9, current_gripper]
-                        ).astype(np.float32)
-
-                        # Save before inference so failed requests still retain inputs.
                         capture_prefix = None
                         if capture_dir is not None:
                             capture_prefix = os.path.join(capture_dir, f'{capture_idx:06d}')
                             capture_idx += 1
-                            np.savez(
-                                capture_prefix + '_input.npz',
-                                image_rgb=image, state10=current_state,
-                                measured_pose6=current_pose6,
-                                gripper_width_m=np.asarray(obs['robot0_gripper_width'][-1]),
-                                observation_timestamps=np.asarray(obs_timestamps),
-                                prompt=np.asarray(prompt), step=np.asarray(iter_idx),
-                            )
-                            if not cv2.imwrite(capture_prefix + '_image.png', image[..., ::-1]):
-                                raise IOError('Could not save policy input image')
+                            np.savez(capture_prefix + '_input.npz',
+                                     images_rgb=np.stack(images), state=current_state,
+                                     measured_poses6=current_poses6, gripper_widths_m=current_widths,
+                                     observation_timestamps=np.asarray(obs_timestamps),
+                                     prompt=np.asarray(prompt), step=np.asarray(iter_idx))
+                            for i, image in enumerate(images):
+                                if not cv2.imwrite(capture_prefix + f'_camera{i}.png', image[..., ::-1]):
+                                    raise IOError('Could not save policy input image')
 
                         # 调用服务器获取动作
                         s = time.time()
-                        raw_action = policy_client.call_server(image, current_state)
+                        raw_action = policy_client.call_server(images, current_state)
                         response_received_at = time.time()
                         if capture_prefix is not None:
                             np.savez(
                                 capture_prefix + '_response.npz',
-                                actions=np.asarray(raw_action) if raw_action is not None else np.empty((0, 10), dtype=np.float32),
+                                actions=np.asarray(raw_action) if raw_action is not None else np.empty((0, 10 * num_robots), dtype=np.float32),
                                 response_valid=np.asarray(raw_action is not None),
                                 request_started_at=np.asarray(s),
                                 response_received_at=np.asarray(response_received_at),
@@ -512,40 +425,23 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             iter_idx += 1
                             continue
 
-                        absolute_action10 = (
-                            relative_actions_to_absolute_actions(
-                                raw_action,
-                                base_absolute_action=current_state,
-                            )
-                            if action_is_relative
-                            else raw_action
-                        )
-                        absolute_rot_mats = ortho6d_to_rotation_matrix(
-                            absolute_action10[:, 3:9]
-                        )
-                        absolute_rotvec = st.Rotation.from_matrix(
-                            absolute_rot_mats
-                        ).as_rotvec()
-                        action = np.concatenate([
-                            absolute_action10[:, :3],
-                            absolute_rotvec,
-                            absolute_action10[:, 9:10]
-                            * model_to_hardware_gripper_scale,
-                        ], axis=-1)
+                        action = decode_actions(raw_action, current_poses6,
+                                                model_to_hardware_gripper_scale,
+                                                action_is_relative, options)
                         action_horizon = action.shape[0]
 
                         # all_time_actions[[iter_idx], iter_idx:iter_idx + action_horizon] = action
                         if temporal_agg:
                             required_steps = max_timesteps + action_horizon
                             if all_time_actions is None or iter_idx == 0:
-                                all_time_actions = np.zeros(
-                                    (max_timesteps, required_steps, action_dim)
+                                all_time_actions = np.full(
+                                    (max_timesteps, required_steps, action_dim), np.nan
                                 )
                             elif all_time_actions.shape[1] < required_steps:
                                 all_time_actions = np.pad(all_time_actions, (
                                     (0, 0),
                                     (0, required_steps - all_time_actions.shape[1]),
-                                    (0, 0)))
+                                    (0, 0)), constant_values=np.nan)
                             all_time_actions[
                                 iter_idx, iter_idx:iter_idx + action_horizon
                             ] = action
@@ -559,16 +455,14 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                                 target_pose_list = []
                                 for i in range(action_horizon):
                                     actions_for_curr_step = action_seq_for_curr_step[max(0, iter_idx - ensemble_steps + 1):iter_idx + 1, i]
-                                    actions_populated = np.all(actions_for_curr_step != 0, axis=1)
+                                    actions_populated = np.all(np.isfinite(actions_for_curr_step), axis=1)
                                     actions_for_curr_step = actions_for_curr_step[actions_populated]
 
                                     if len(actions_for_curr_step) > 0:
                                         k = -0.01
                                         exp_weights = np.exp(k * np.arange(len(actions_for_curr_step)))
                                         exp_weights = exp_weights / exp_weights.sum()
-                                        weighted_rotvec = R.from_rotvec(np.array(actions_for_curr_step)[:, 3:6]).mean(weights=exp_weights).as_rotvec()
-                                        weighted_action = (actions_for_curr_step * exp_weights[:, np.newaxis]).sum(axis=0, keepdims=True)
-                                        weighted_action[0][3:6] = weighted_rotvec
+                                        weighted_action = average_actions(actions_for_curr_step, exp_weights)
                                         target_pose_list.append(weighted_action)
                                     else:
                                         target_pose_list.append(action[[i]])
@@ -642,91 +536,44 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                                 f"selection_margin={action_exec_latency:.3f}s dt={dt:.4f}s"
                             )
                             if len(selected_indices):
-                                # Estimate only: observation may be old and this is not
-                                # the controller's current commanded/interpolated pose.
-                                lead_s = action_timestamps[0] - float(
-                                    robots_config[0].get('robot_action_latency', 0.0)
-                                ) - time.time()
-                                first_target = this_target_poses[0]
-                                distance_m = np.linalg.norm(first_target[:3] - current_pose6[:3])
-                                angle_rad = (
-                                    st.Rotation.from_rotvec(current_pose6[3:6]).inv()
-                                    * st.Rotation.from_rotvec(first_target[3:6])
-                                ).magnitude()
-                                print(
-                                    f"[Timing] first target vs request observation: "
-                                    f"distance={distance_m * 1000:.1f}mm "
-                                    f"rotation={np.rad2deg(angle_rad):.2f}deg "
-                                    f"compensated_lead={lead_s * 1000:.1f}ms; "
-                                    + (f"distance/time estimate={distance_m / lead_s:.3f}m/s, "
-                                       f"{np.rad2deg(angle_rad) / lead_s:.1f}deg/s "
-                                       "(not measured velocity)" if lead_s > 0 else "TARGET ALREADY DUE")
-                                )
-
-
-                        #    # 执行动作 (pdb单步调试: 按c继续执行, 按q退出)
-                        #     print(f"\n[PDB] Step {iter_idx}: About to execute {len(this_target_poses)} actions")
-                        #     print(f"[PDB] Target poses:\n{this_target_poses}")
-                        #     breakpoint()
-
-                        #     # pdb恢复后重新计算时间戳，确保在未来
-                        #     action_timestamps = (np.arange(len(this_target_poses), dtype=np.float64)) * dt + time.time() + 0.01
+                                for i, rc in enumerate(robots_config):
+                                    lead = action_timestamps[0] - float(rc.get('robot_action_latency', 0)) - time.time()
+                                    target = this_target_poses[0, 7*i:7*i+6]
+                                    delta = np.linalg.norm(target[:3] - current_poses6[i, :3]) * 1000
+                                    print(f'[Timing] robot{i}: target distance={delta:.1f}mm compensated_lead={lead*1000:.1f}ms')
+                            if capture_prefix is not None:
+                                np.savez(capture_prefix + '_execution.npz',
+                                         decoded_actions=action, selected_actions=this_target_poses,
+                                         target_timestamps=action_timestamps, selected_indices=selected_indices,
+                                         debug_actions=np.asarray(debug_actions))
 
                             if debug_actions:
-                                # Observe only: never send a HOLD or model command here.
                                 latest = env.get_obs()
-                                measured = np.concatenate([
-                                    latest['robot0_eef_pos'][-1],
-                                    latest['robot0_eef_rot_axis_angle'][-1],
-                                ])
-                                checked_at = time.time()
-                                robot_latency = float(robots_config[0].get('robot_action_latency', 0.0))
-                                lead_ms = (action_timestamps - robot_latency - checked_at) * 1000
-                                translation_mm = np.linalg.norm(this_target_poses[:, :3] - measured[:3], axis=1) * 1000
-                                rotation_deg = np.rad2deg((
-                                    st.Rotation.from_rotvec(measured[3:6]).inv()
-                                    * st.Rotation.from_rotvec(this_target_poses[:, 3:6])
-                                ).magnitude())
-                                record = dict(
-                                    step=iter_idx, wall_time=checked_at,
-                                    server_metadata=policy_client.metadata,
-                                    configured_relative=action_is_relative,
-                                    tx_flange_tcp=robots_config[0].get('tx_flange_tcp'),
-                                    hardware_to_model_gripper_scale=hardware_to_model_gripper_scale,
-                                    model_to_hardware_gripper_scale=model_to_hardware_gripper_scale,
-                                    input_state10=current_state.tolist(),
-                                    inference_base_pose6=current_pose6.tolist(),
-                                    image_shape=list(image.shape), image_dtype=str(image.dtype),
-                                    raw_actions10=np.asarray(raw_action).tolist(),
-                                    decoded_absolute_actions7=action.tolist(),
-                                    selected_targets7=this_target_poses.tolist(),
-                                    measured_pose6=measured.tolist(),
-                                    measured_gripper_m=np.asarray(latest['robot0_gripper_width'][-1]).tolist(),
-                                    observation_timestamp=float(obs_timestamps[-1]),
-                                    latest_observation_timestamp=float(latest['timestamp'][-1]),
-                                    network_latency_s=inference_time,
-                                    action_timestamps=action_timestamps.tolist(),
-                                    robot_action_latency_s=robot_latency,
-                                    compensated_lead_ms=lead_ms.tolist(),
-                                    translation_delta_mm=translation_mm.tolist(),
-                                    rotation_delta_deg=rotation_deg.tolist(),
-                                    targets_submitted=False,
-                                )
+                                arms = []
+                                for i, rc in enumerate(robots_config):
+                                    measured = np.r_[latest[f'robot{i}_eef_pos'][-1], latest[f'robot{i}_eef_rot_axis_angle'][-1]]
+                                    targets = this_target_poses[:, 7*i:7*i+7]
+                                    arms.append(dict(robot_index=i, endpoint=[rc['robot_ip'], rc.get('robot_port', 4242)],
+                                                     measured_pose6=measured.tolist(),
+                                                     translation_delta_mm=(np.linalg.norm(targets[:, :3]-measured[:3], axis=1)*1000).tolist(),
+                                                     rotation_delta_deg=np.rad2deg((st.Rotation.from_rotvec(measured[3:6]).inv()*st.Rotation.from_rotvec(targets[:, 3:6])).magnitude()).tolist(),
+                                                     compensated_lead_ms=((action_timestamps-float(rc.get('robot_action_latency', 0))-time.time())*1000).tolist()))
+                                record = dict(step=iter_idx, wall_time=time.time(), arms=arms,
+                                              contract=options, configured_relative=action_is_relative,
+                                              input_state=current_state.tolist(), raw_actions=raw_action.tolist(),
+                                              inference_base_poses6=current_poses6.tolist(),
+                                              decoded_absolute_actions=action.tolist(), selected_targets=this_target_poses.tolist(),
+                                              action_timestamps=action_timestamps.tolist(), targets_submitted=False)
                                 with open(debug_path, 'a') as debug_file:
-                                    debug_file.write(json.dumps(record, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x)) + "\n")
-                                print(f"DEBUG step {iter_idx}: NO TARGETS SUBMITTED")
-                                print(f"  measured xyz(m)/rotvec(rad): {measured}")
-                                print(f"  raw first action: {raw_action[0]}")
-                                for j, target in enumerate(this_target_poses[:3]):
-                                    print(f"  target[{j}] xyz(m)/rotvec(rad)/gripper(m): {target}")
-                                    print(f"    delta={translation_mm[j]:.2f} mm, {rotation_deg[j]:.2f} deg; compensated lead={lead_ms[j]:.1f} ms")
+                                    debug_file.write(json.dumps(record) + '\n')
+                                print(f'DEBUG step {iter_idx}: NO TARGETS SUBMITTED to either arm')
                             else:
                                 env.exec_actions(
                                     actions=this_target_poses,
                                     timestamps=action_timestamps,
                                     compensate_latency=True
                                 )
-                                print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions, gripper={action[0, 6]:.4f}")
+                                print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions, grippers_m={this_target_poses[0, 6::7].tolist()}")
                             # print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions")
                         # 可视化
                         vis_img = obs[f'camera{vis_camera_idx}_rgb'][-1]
@@ -754,7 +601,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             stop_episode = True
 
                         if stop_episode:
-                            env.end_episode()
+                            finish_episode_recording(env)
                             break
 
                         precise_wait(t_cycle_end - frame_latency)
@@ -763,7 +610,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
                 except KeyboardInterrupt:
                     print("\nInterrupted!")
-                    env.end_episode()
+                finally:
+                    finish_episode_recording(env)
 
                 print("Episode ended.")
 

@@ -8,7 +8,6 @@ from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
-from umi.real_world.custom_gripper_controller import CustomGripperController
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
     TimestampActionAccumulator,
@@ -233,9 +232,9 @@ class BimanualUmiEnv:
         if not init_joints:
             j_init = None
 
-        # assert len(robots_config) == len(grippers_config)
+        assert len(robots_config) == len(grippers_config)
         robots: List[RTDEInterpolationController] = list()
-        # grippers: List[WSGController] = list()
+        grippers = list()
         for rc in robots_config:
             if rc['robot_type'].startswith('ur5'):
                 assert rc['robot_type'] in ['ur5', 'ur5e']
@@ -262,6 +261,7 @@ class BimanualUmiEnv:
                 this_robot = FrankaInterpolationController(
                     shm_manager=shm_manager,
                     robot_ip=rc['robot_ip'],
+                    robot_port=int(rc.get('robot_port', 4242)),
                     frequency=200,
                     Kx_scale=1.0,
                     Kxd_scale=1.0, #np.array([2.0,1.5,2.0,1.0,1.0,1.0]),
@@ -275,61 +275,26 @@ class BimanualUmiEnv:
                 raise NotImplementedError()
             robots.append(this_robot)
 
-        for gc, rc in zip(grippers_config, robots_config):
-            # Determine gripper type from robot type or explicit config
-            gripper_type = gc.get('gripper_type', 'wsg')  # Default to WSG for backward compatibility
-
-            # Auto-detect: if robot is Franka, use Franka gripper
-            if rc['robot_type'].startswith('franka') and gripper_type == 'wsg':
-                gripper_type = 'franka'
-
-            if gripper_type == 'franka':
-                this_gripper = FrankaGripperController(
-                    shm_manager=shm_manager,
-                    robot_ip=rc['robot_ip'],  # Use robot IP (NUC IP)
-                    robot_port=4242,
-                    frequency=100,
-                    move_max_speed=gc.get('gripper_max_speed', 0.2),
-                    move_max_force=gc.get('gripper_max_force', 70.0),
-                    receive_latency=gc['gripper_obs_latency'],
-                    verbose=False
-                )
-            elif gripper_type == 'custom':
-                # this_gripper = CustomGripperController(
-                #     shm_manager=shm_manager,
-                #     port1=gc['port1'],
-                #     motor1_id=gc['motor1_id'],
-                #     port2=gc.get('port2', None),
-                #     motor2_id=gc.get('motor2_id', None),
-                #     mode=gc.get('mode', 'single'),
-                #     frequency=gc.get('frequency', 30),
-                #     move_max_speed=gc.get('gripper_max_speed', 0.2),
-                #     move_max_force=gc.get('gripper_max_force', 10.0),
-                #     receive_latency=gc['gripper_obs_latency'],
-                #     verbose=False
-                # )
+        for gc in grippers_config:
+            gripper_type = gc.get('gripper_type', 'wsg')
+            if gripper_type == 'custom':
+                # Each robot has its own single-motor hand and serial port.
                 this_gripper = GripperController(
-                    port1=gc['port1'],
-                    motor1_id=gc['motor1_id'],
-                    mode=gc.get('mode', 'single')
-                )
-            else:  # WSG gripper
+                    port1=gc['port'], motor1_id=gc['motor_id'], mode='single')
+            elif gripper_type == 'wsg':
                 this_gripper = WSGController(
                     shm_manager=shm_manager,
-                    hostname=gc['gripper_ip'],
-                    port=gc['gripper_port'],
-                    receive_latency=gc['gripper_obs_latency'],
-                    use_meters=True
-                )
-
-            # grippers.append(this_gripper)
+                    hostname=gc['gripper_ip'], port=gc['gripper_port'],
+                    receive_latency=gc['gripper_obs_latency'], use_meters=True)
+            else:
+                raise ValueError(f'Unsupported gripper_type: {gripper_type}')
+            grippers.append(this_gripper)
 
         self.camera = camera
         
         self.robots = robots
         self.robots_config = robots_config
-        # self.grippers = grippers
-        self.gripper_controller = this_gripper
+        self.grippers = grippers
         self.grippers_config = grippers_config
 
         self.multi_cam_vis = multi_cam_vis
@@ -373,9 +338,11 @@ class BimanualUmiEnv:
         self.camera.start(wait=self.camera_startup_first)
         for robot in self.robots:
             robot.start(wait=False)
-        self.gripper_controller.start()
-        # for gripper in self.grippers:
-        #     gripper.start(wait=False)
+        for gripper, gc in zip(self.grippers, self.grippers_config):
+            if gc.get('gripper_type', 'wsg') == 'custom':
+                gripper.start()
+            else:
+                gripper.start(wait=False)
 
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start(wait=False)
@@ -388,9 +355,11 @@ class BimanualUmiEnv:
             self.multi_cam_vis.stop(wait=False)
         for robot in self.robots:
             robot.stop(wait=False)
-        # for gripper in self.grippers:
-        #     gripper.stop(wait=False)
-        self.gripper_controller.stop()
+        for gripper, gc in zip(self.grippers, self.grippers_config):
+            if gc.get('gripper_type', 'wsg') == 'custom':
+                gripper.stop()
+            else:
+                gripper.stop(wait=False)
         self.camera.stop(wait=False)
         if wait:
             self.stop_wait()
@@ -399,16 +368,18 @@ class BimanualUmiEnv:
         self.camera.start_wait()
         for robot in self.robots:
             robot.start_wait()
-        # for gripper in self.grippers:
-        #     gripper.start_wait()
+        for gripper, gc in zip(self.grippers, self.grippers_config):
+            if gc.get('gripper_type', 'wsg') != 'custom':
+                gripper.start_wait()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start_wait()
     
     def stop_wait(self):
         for robot in self.robots:
             robot.stop_wait()
-        # for gripper in self.grippers:
-        #     gripper.stop_wait()
+        for gripper, gc in zip(self.grippers, self.grippers_config):
+            if gc.get('gripper_type', 'wsg') != 'custom':
+                gripper.stop_wait()
         self.camera.stop_wait()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.stop_wait()
@@ -419,7 +390,6 @@ class BimanualUmiEnv:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.gripper_controller.stop()
         self.stop()
 
     # ========= async env API ===========
@@ -459,13 +429,8 @@ class BimanualUmiEnv:
         # 125/500 hz, robot_receive_timestamp
         for robot in self.robots:
             last_robots_data.append(robot.get_all_state())
-        # 30 hz, gripper_receive_timestamp
-        # for gripper in self.grippers:
-        #     last_grippers_data.append(gripper.get_all_state())
-        # width, _, force, gripper_timestamp, _, _, _ = self.gripper_controller.get_current_gripper_states()
-        # last_grippers_data.append(gripper_timestamp)
-        # last_grippers_data.append(width)
-        last_grippers_data.append(self.gripper_controller.get_all_state())
+        for gripper in self.grippers:
+            last_grippers_data.append(gripper.get_all_state())
 
         # select align_camera_idx
         num_obs_cameras = len(self.robots)
@@ -478,12 +443,11 @@ class BimanualUmiEnv:
             for other_camera_idx in range(num_obs_cameras):
                 if other_camera_idx == camera_idx:
                     continue
-                other_timestep_idx = -1
-                while True:
-                    if self.last_camera_data[other_camera_idx]['timestamp'][other_timestep_idx] < this_timestamp:
-                        this_error += this_timestamp - self.last_camera_data[other_camera_idx]['timestamp'][other_timestep_idx]
-                        break
-                    other_timestep_idx -= 1
+                other_timestamps = self.last_camera_data[other_camera_idx]['timestamp']
+                # Same previous-frame alignment as UMI, bounded at startup when
+                # the other camera has no earlier frame in its history yet.
+                other_timestep_idx = max(0, np.searchsorted(other_timestamps, this_timestamp) - 1)
+                this_error += abs(this_timestamp - other_timestamps[other_timestep_idx])
             if align_camera_idx is None or this_error < running_best_error:
                 running_best_error = this_error
                 align_camera_idx = camera_idx
@@ -542,7 +506,7 @@ class BimanualUmiEnv:
             gripper_obs = {
                 f'robot{robot_idx}_gripper_width': gripper_interpolator(gripper_obs_timestamps)
             }
-        obs_data.update(gripper_obs)
+            obs_data.update(gripper_obs)
 
         # gripper_interpolator = get_interp1d(
         #     t=last_grippers_data[0],
@@ -618,9 +582,8 @@ class BimanualUmiEnv:
 
         # schedule waypoints
         for i in range(len(new_actions)):
-            # import pdb;pdb.set_trace()
-            # for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(self.robots, self.grippers, self.robots_config, self.grippers_config)):
-            for robot_idx, (robot, rc, gc) in enumerate(zip(self.robots, self.robots_config, self.grippers_config)):
+            for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(
+                    self.robots, self.grippers, self.robots_config, self.grippers_config)):
                 r_latency = rc['robot_action_latency'] if compensate_latency else 0.0
                 g_latency = gc['gripper_action_latency'] if compensate_latency else 0.0
                 r_actions = new_actions[i, 7 * robot_idx + 0: 7 * robot_idx + 6]
@@ -629,16 +592,12 @@ class BimanualUmiEnv:
                     pose=r_actions,
                     target_time=new_timestamps[i] - r_latency
                 )
-                if i == 0:
-                    self.gripper_controller.move_gripper(
-                        g_actions,
-                        force_limit_nm=float(gc.get('force_limit_nm', 1.5)),
-                    )
-        
-                # gripper.schedule_waypoint(
-                #     pos=g_actions,
-                #     target_time=new_timestamps[i] - g_latency
-                # )
+                if gc.get('gripper_type', 'wsg') == 'custom':
+                    # Preserve this driver's first-width-per-chunk behavior.
+                    if i == 0:
+                        gripper.move_gripper(g_actions, force_limit_nm=float(gc.get('force_limit_nm', 1.5)))
+                else:
+                    gripper.schedule_waypoint(pos=g_actions, target_time=new_timestamps[i] - g_latency)
 
         # record actions
         if self.action_accumulator is not None:
@@ -651,11 +610,9 @@ class BimanualUmiEnv:
         return [robot.get_state() for robot in self.robots]
     
     def get_gripper_state(self):
-        width = self.gripper_controller.get_current_gripper_width()
-        return [{
-            'gripper_position': width
-        }]
-        # return [gripper.get_state() for gripper in self.grippers]
+        return [({'gripper_position': gripper.get_current_gripper_width()}
+                 if gc.get('gripper_type', 'wsg') == 'custom' else gripper.get_state())
+                for gripper, gc in zip(self.grippers, self.grippers_config)]
 
     # recording API
     def start_episode(self, start_time=None):

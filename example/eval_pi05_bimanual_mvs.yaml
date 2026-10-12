@@ -1,0 +1,134 @@
+# python policy_client_pi_episodes.py \
+#   --robot-config example/eval_pi05_bimanual_mvs.yaml \
+#   --output data_local/bimanual_debug \
+#   --debug-actions --save-policy-data \
+#   --max-duration 20 --max-timesteps 100
+
+{
+  # Arm count and order come from the hardware lists below.
+  "policy": {
+    "server_url": "ws://127.0.0.1:8099",
+    "prompt": null, # TODO: task prompt
+    "request_timeout_s": 30.0,
+    "control_fps": 20.0,
+    "image_resolution": 240,
+    "exec_horizon_steps": 24,
+    "action_is_relative": false,
+    "hardware_to_model_gripper_scale": 33.3333333333,
+    "model_to_hardware_gripper_scale": 0.03
+  },
+  
+  # Camera order: 0 -> right wrist, 1 -> left wrist.
+  "cameras": [
+    {
+      "backend": "mvs",
+      "serial": null, # TODO: fill hardware identifier
+      "width": 480,
+      "height": 480,
+      "fps": 30,
+      "rotate_180": true,
+      "exposure_time": 7500.0,
+      "enable_auto_gain": true,
+      "enable_auto_white_balance": true,
+      "black_level_enable": true,
+      "black_level": 240,
+      "brightness": 40,
+      "sensor_roi": {
+        "enabled": true,
+        "offset_x": 720,
+        "offset_y": 720,
+        "width": 1080,
+        "height": 1080
+      },
+      "receive_latency": 0.0,
+      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+      "sdk_runtime": "/opt/MVS/lib",
+      "launch_timeout": 15,
+      "frame_timeout_ms": 1000,
+      "recording_codec": "libx264"
+    },
+    {
+      "backend": "mvs",
+      "serial": "REPLACE_LEFT_CAMERA_SERIAL",
+      "width": 480,
+      "height": 480,
+      "fps": 30,
+      "rotate_180": true,
+      "exposure_time": 7500.0,
+      "enable_auto_gain": true,
+      "enable_auto_white_balance": true,
+      "black_level_enable": true,
+      "black_level": 240,
+      "brightness": 40,
+      "sensor_roi": {
+        "enabled": true,
+        "offset_x": 720,
+        "offset_y": 720,
+        "width": 1080,
+        "height": 1080
+      },
+      "receive_latency": 0.0,
+      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+      "sdk_runtime": "/opt/MVS/lib",
+      "launch_timeout": 15,
+      "frame_timeout_ms": 1000,
+      "recording_codec": "libx264"
+    }
+  ],
+
+  # Robot order: 0 -> right, 1 -> left. robot_ip is the NUC address.
+  "robots": [
+    {
+      "robot_type": "franka",
+      "robot_ip": null, # TODO: fill hardware identifier
+      "robot_port": null, # TODO: fill hardware identifier
+      "robot_obs_latency": 0.0001,
+      "robot_action_latency": 0.1,
+      "tx_flange_tcp": null,
+      "joints_init": null,
+      "joints_init_duration": 5.0,
+      "height_threshold": -.inf,
+      "sphere_radius": 0.0,
+      "sphere_center": [0, 0, 0]
+    },
+    {
+      "robot_type": "franka",
+      "robot_ip": "REPLACE_LEFT_NUC_IP",
+      "robot_port": 4243,
+      "robot_obs_latency": 0.0001,
+      "robot_action_latency": 0.1,
+      "tx_flange_tcp": null,
+      "joints_init": null,
+      "joints_init_duration": 5.0,
+      "height_threshold": -.inf,
+      "sphere_radius": 0.0,
+      "sphere_center": [0, 0, 0]
+    }
+  ],
+  # One independent single-motor gripper per arm, in the same order.
+  # Existing startup behavior: current motor position is set as zero.
+  "grippers": [
+    {
+      "gripper_type": "custom",
+      "port": "/dev/serial/by-id/REPLACE_RIGHT_SERIAL_ADAPTER",
+      "motor_id": 1,
+      "mode": "single",
+      "initial_position": 0.06,
+      "force_limit_nm": 1.5,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    },
+    {
+      "gripper_type": "custom",
+      "port": "/dev/serial/by-id/REPLACE_LEFT_SERIAL_ADAPTER",
+      "motor_id": 1,
+      "mode": "single",
+      "initial_position": 0.06,
+      "force_limit_nm": 1.5,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    }
+  ],
+  # transformation right arm's base frame in left arm's base coordinate frame
+  "tx_left_right": null
+}
