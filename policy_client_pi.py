@@ -29,7 +29,7 @@ from umi.common.precise_sleep import precise_wait
 from umi.common.pose_util import pose_to_mat, mat_to_pose
 from umi.real_world.bimanual_policy import (
     PolicyClient, policy_options, validate_hardware_config,
-    gripper_scales, build_observation, decode_actions, average_actions,
+    configure_gripper_conversion, build_observation, decode_actions, average_actions,
 )
 
 # # 尝试导入 json_numpy
@@ -178,8 +178,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     if any(rc['robot_type'] != 'franka' for rc in robots_config):
         raise click.UsageError('This PI05 client supports one or two Frankas')
     options = policy_options(policy_config, num_robots)
-    hardware_to_model_gripper_scale = gripper_scales(hardware_to_model_gripper_scale, num_robots)
-    model_to_hardware_gripper_scale = gripper_scales(model_to_hardware_gripper_scale, num_robots)
+    hardware_to_model_gripper_scale, model_to_hardware_gripper_scale = configure_gripper_conversion(
+        grippers_config, hardware_to_model_gripper_scale, model_to_hardware_gripper_scale, options)
     if (not np.isfinite(frequency) or frequency <= 0 or steps_per_inference <= 0
             or exec_horizon_steps <= 0 or exec_horizon_steps > 256 or max_timesteps <= 0
             or not np.isfinite(max_duration) or max_duration <= 0 or ensemble_steps <= 0):
@@ -238,6 +238,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 image_resolution=obs_image_resolution,
                 hardware_to_model_gripper_scale=hardware_to_model_gripper_scale.tolist(),
                 model_to_hardware_gripper_scale=model_to_hardware_gripper_scale.tolist(),
+                hardware_to_model_gripper_offset=options['hardware_to_model_gripper_offset'],
+                model_to_hardware_gripper_offset=options['model_to_hardware_gripper_offset'],
             ), capture_file, indent=2, default=str)
     debug_path = os.path.join(os.path.expanduser(output), 'action_debug.jsonl')
     if debug_actions:

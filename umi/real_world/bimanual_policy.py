@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+from umi.real_world.gripper_calibration import width_to_rad_parameters
 
 
 def validate_hardware_config(robots, grippers):
@@ -17,7 +18,7 @@ def validate_hardware_config(robots, grippers):
     custom = [gc for gc in grippers if gc.get('gripper_type') == 'custom']
     if any(gc.get('mode', 'single') != 'single' for gc in custom):
         raise ValueError('Use one single-mode custom gripper entry per arm')
-    ports = [os.path.realpath(os.path.expanduser(gc['port1'])) for gc in custom]
+    ports = [os.path.realpath(os.path.expanduser(gc['port'])) for gc in custom]
     if len(set(ports)) != len(ports):
         raise ValueError('Custom grippers require separate serial ports')
 
@@ -26,7 +27,7 @@ def policy_options(config, num_robots):
     """Choose the wire keys from robot count; every arm block follows list order."""
     if num_robots not in (1, 2):
         raise ValueError('Configure one or two robots')
-    default_image_keys = (['observation/image_right'] if num_robots == 1 else
+    default_image_keys = (['observation/image'] if num_robots == 1 else
                           ['observation/image_right', 'observation/image_left'])
     if 'action_is_relative' in config and not isinstance(config['action_is_relative'], bool):
         raise ValueError('action_is_relative must be a YAML boolean, not a quoted string')
@@ -50,6 +51,30 @@ def gripper_scales(value, count):
     if not np.isfinite(scales).all() or (scales <= 0).any():
         raise ValueError('Gripper scales must be positive; use a scalar or one value per robot')
     return scales
+
+
+def configure_gripper_conversion(grippers, hardware_scales, model_scales, options):
+    """Per-gripper calibration overrides the legacy policy scales for that arm."""
+    count = len(grippers)
+    forward = gripper_scales(hardware_scales, count)
+    inverse = gripper_scales(model_scales, count)
+    forward_offset, inverse_offset = np.zeros(count), np.zeros(count)
+    limits = [None] * count
+    for i, gc in enumerate(grippers):
+        calibration = width_to_rad_parameters(gc.get('width_to_rad'))
+        if calibration is None:
+            continue
+        scale, offset, lo, hi = calibration
+        initial = gc.get('initial_position')
+        if initial is not None and not lo <= float(initial) <= hi:
+            raise ValueError(f'gripper{i}: initial_position must be inside width_to_rad width limits')
+        forward[i], inverse[i] = scale, 1.0 / scale
+        forward_offset[i], inverse_offset[i] = offset, -offset / scale
+        limits[i] = (lo, hi)
+    options['hardware_to_model_gripper_offset'] = forward_offset.tolist()
+    options['model_to_hardware_gripper_offset'] = inverse_offset.tolist()
+    options['gripper_width_limits'] = limits
+    return forward, inverse
 
 
 def pack_state(arm_states):
@@ -91,7 +116,7 @@ def build_observation(obs, count, resolution, scales, options):
         pose = np.concatenate([obs[f'robot{i}_eef_pos'][-1], obs[f'robot{i}_eef_rot_axis_angle'][-1]])
         width = float(np.asarray(obs[f'robot{i}_gripper_width'][-1]).reshape(-1)[0])
         rot6 = Rotation.from_rotvec(pose[3:]).as_matrix()[:, :2].T.reshape(6)
-        states.append(np.r_[pose[:3], rot6, width * scales[i]])
+        states.append(np.r_[pose[:3], rot6, width * scales[i] + options.get('hardware_to_model_gripper_offset', np.zeros(count))[i]])
         poses.append(pose)
         widths.append(width)
     if not np.isfinite(states).all():
@@ -114,7 +139,11 @@ def decode_actions(raw, poses, scales, relative, options):
         output[:, i, :3] = positions
         output[:, i, 3:6] = Rotation.from_matrix(rotations).as_rotvec()
         # Gripper targets remain absolute, even when TCP targets are relative.
-        output[:, i, 6] = blocks[:, i, 9] * scales[i]
+        output[:, i, 6] = (blocks[:, i, 9] * scales[i]
+                           + options.get('model_to_hardware_gripper_offset', np.zeros(count))[i])
+        if options.get('gripper_width_limits', [None] * count)[i] is not None:
+            lo, hi = options['gripper_width_limits'][i]
+            output[:, i, 6] = np.clip(output[:, i, 6], lo, hi)
     return output.reshape(len(output), 7 * count)
 
 

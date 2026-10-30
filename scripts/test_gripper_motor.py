@@ -65,7 +65,8 @@ def run_test(controller, args):
         return
 
     target = args.move_mm / 1000.0
-    if not math.isfinite(target) or not 0 <= target <= controller.MOTOR_PHYSICAL_LIMIT_M:
+    min_width = controller.width_calibration[2] if controller.width_calibration is not None else 0
+    if not math.isfinite(target) or not min_width <= target <= controller.MOTOR_PHYSICAL_LIMIT_M:
         raise ValueError('Requested width is outside the driver range')
     initial = controller._angle_to_width(controller.motor1.getPosition())
     if abs(target - initial) * 1000 > args.max_travel_mm:
@@ -107,9 +108,10 @@ def main(argv=None):
     parser.add_argument('--config', default=str(ROOT / 'example/eval_pi05_lift_bottle_mvs.yaml'))
     parser.add_argument('--port', help='Override grippers[0].port1')
     parser.add_argument('--motor-id', type=int, help='Override grippers[0].motor1_id')
+    parser.add_argument('--gripper-index', type=int, default=0, help='Gripper list index: 0 right, 1 left')
     parser.add_argument('--seconds', type=positive, default=5.0)
     parser.add_argument('--move-mm', type=float, help='Explicit motion request: absolute driver width in mm')
-    parser.add_argument('--max-travel-mm', type=positive, default=10.0)
+    parser.add_argument('--max-travel-mm', type=positive, default=150.0)
     parser.add_argument('--speed-mm-s', type=positive, default=5.0)
     parser.add_argument('--torque-limit', type=positive, default=0.3)
     parser.add_argument('--tolerance-mm', type=positive, default=1.0)
@@ -117,15 +119,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     import yaml
     with open(args.config) as stream:
-        config = yaml.safe_load(stream)['grippers'][0]
+        grippers = yaml.safe_load(stream)['grippers']
+    if not 0 <= args.gripper_index < len(grippers):
+        parser.error('--gripper-index is outside the configured gripper list')
+    config = grippers[args.gripper_index]
     if config.get('gripper_type') != 'custom' or config.get('mode', 'single') != 'single':
         parser.error('This test requires a custom gripper in single-motor mode')
-    port = args.port or config['port1']
-    motor_id = args.motor_id if args.motor_id is not None else config['motor1_id']
+    port = args.port or config.get('port', config.get('port1'))
+    motor_id = args.motor_id if args.motor_id is not None else config.get('motor_id', config.get('motor1_id', 1))
     from umi.real_world.gripper_controller_1_14 import GripperController
     print(f'Opening LK motor ID {motor_id} on {port}; '
           f'mode={"MOVE" if args.move_mm is not None else "READ ONLY"}', flush=True)
-    controller = GripperController(mode='single', port1=port, motor1_id=motor_id)
+    controller = GripperController(mode='single', port1=port, motor1_id=motor_id,
+                                   width_to_rad=config.get('width_to_rad'))
     try:
         run_test(controller, args)
     finally:

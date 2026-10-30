@@ -77,7 +77,7 @@ def test_single_arm_wire_format_and_decode_unchanged():
     raw = np.r_[pose9([0.1, 0, 0], Rotation.identity()), 2][None]
     result = decode_actions(raw, base, [0.03], True, options)
     np.testing.assert_allclose(result, [[1.1, 0, 0, 0, 0, 0, 0.06]])
-    assert options['image_keys'] == ['observation/image_right']
+    assert options['image_keys'] == ['observation/image']
 
 
 def test_request_contains_distinct_images_and_exact_state():
@@ -102,7 +102,7 @@ def configs():
     robots = [dict(robot_type='franka', robot_ip=f'nuc{i}', robot_port=4242,
                    robot_obs_latency=0, robot_action_latency=0.1 + 0.1*i,
                    tx_flange_tcp=np.eye(4).tolist()) for i in range(2)]
-    grippers = [dict(gripper_type='custom', port1=f'/dev/hand{i}', motor1_id=1,
+    grippers = [dict(gripper_type='custom', port=f'/dev/hand{i}', motor_id=1,
                      mode='single', gripper_obs_latency=0.01, gripper_action_latency=0.1)
                 for i in range(2)]
     return robots, grippers
@@ -117,7 +117,7 @@ def test_duplicate_endpoints_and_ports_rejected():
     robots[1]['robot_port'] = 4243
     validate_hardware_config(robots, grippers)  # Same host, distinct endpoints are supported.
     robots[1]['robot_ip'] = 'nuc1'
-    grippers[1]['port1'] = grippers[0]['port1']
+    grippers[1]['port'] = grippers[0]['port']
     with pytest.raises(ValueError, match='separate serial ports'):
         validate_hardware_config(robots, grippers)
 
@@ -192,6 +192,7 @@ def test_env_constructs_two_independent_workers_and_hands(tmp_path, monkeypatch,
     monkeypatch.setitem(sys.modules, 'umi.real_world.mvs_camera_service',
                         types.SimpleNamespace(IsolatedMultiMvsCamera=lambda **k: types.SimpleNamespace(n_cameras=2)))
     robots, grippers = configs()
+    grippers[0]['width_to_rad'] = dict(min_abs_width_m=.01, max_abs_width_m=.08, min_rad=0., max_rad=3.5)
     robots[1]['robot_port'] = 4243
     if same_nuc:
         robots[1]['robot_ip'] = robots[0]['robot_ip']
@@ -203,6 +204,8 @@ def test_env_constructs_two_independent_workers_and_hands(tmp_path, monkeypatch,
     assert [r.robot_port for r in env.robots] == [4242, 4243]
     assert [r.frequency for r in env.robots] == [200, 200]
     assert [g.port1 for g in env.grippers] == ['/dev/hand0', '/dev/hand1']
+    assert env.grippers[0].width_to_rad == grippers[0]['width_to_rad']
+    assert env.grippers[1].width_to_rad is None
     assert env.grippers[0] is not env.grippers[1]
     with pytest.raises(AttributeError):
         _ = env.gripper_controller
@@ -213,7 +216,7 @@ def make_env():
     env = cls.__new__(cls)
     env.robots_config, env.grippers_config = configs()
     env.robots = [FakeRobot(**rc) for rc in env.robots_config]
-    env.grippers = [FakeGripper(**gc) for gc in env.grippers_config]
+    env.grippers = [FakeGripper(port1=gc['port'], motor1_id=gc['motor_id']) for gc in env.grippers_config]
     env.camera = types.SimpleNamespace(is_ready=True, n_cameras=2)
     env.action_accumulator = env.obs_accumulator = None
     return env, ns
@@ -318,7 +321,8 @@ def test_observation_assembly_uses_both_camera_and_robot_indices(monkeypatch):
 @pytest.mark.parametrize('count', [1, 2])
 @pytest.mark.parametrize('debug', [False, True])
 @pytest.mark.parametrize('entry', ['policy_client_pi.py', 'policy_client_pi_episodes.py'])
-def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkeypatch, debug, entry, count):
+@pytest.mark.parametrize('calibrated', [False, True])
+def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkeypatch, debug, entry, count, calibrated):
     """Exercise request, decode, selection, saving and episode teardown together."""
     import atexit
     import click
@@ -329,6 +333,10 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
     from umi.real_world import bimanual_policy as bp
     robots, grippers = configs()
     robots, grippers = robots[:count], grippers[:count]
+    if calibrated:
+        for i, gc in enumerate(grippers):
+            gc['width_to_rad'] = dict(min_abs_width_m=.005, max_abs_width_m=.1+i*.02,
+                                      min_rad=0., max_rad=3.5)
     for rc in robots:
         rc['height_threshold'] = -1
         rc['sphere_radius'] = 0
@@ -426,7 +434,7 @@ def test_layout_is_implicit_and_default_order_is_right_left():
 @pytest.mark.parametrize('count', [1, 2])
 def test_default_wire_contract_needs_only_hardware_count(count):
     options = policy_options({}, count)
-    keys = ['observation/image_right'] if count == 1 else ['observation/image_right', 'observation/image_left']
+    keys = ['observation/image'] if count == 1 else ['observation/image_right', 'observation/image_left']
     assert options == dict(image_keys=keys, state_key='current_tcp_pose9_gripper')
     client = PolicyClient.__new__(PolicyClient)
     client.options, client.num_robots, client.prompt = options, count, 'task'

@@ -1,0 +1,160 @@
+# python policy_client_pi_episodes.py \
+#   --robot-config example/eval_pi05_bimanual_pick_cup_rod.yaml \
+#   --output data_local/bimanual_debug \
+#   --debug-actions --save-policy-data \
+#   --max-duration 20 --max-timesteps 100
+
+{
+  # Arm count and order come from the hardware lists below.
+  "policy": {
+    "server_url": "ws://127.0.0.1:8099",
+    "prompt": "Pick up the red cup with the left arm and place it on the yellow plate. Then, pick up the white rod with the right arm and place it inside the red cup.",
+    "request_timeout_s": 30.0,
+    "control_fps": 15.0,
+    "image_resolution": 240,
+    "exec_horizon_steps": 16,
+    "action_is_relative": false,
+    # "hardware_to_model_gripper_scale": 33.3333333333,
+    # "model_to_hardware_gripper_scale": 0.03
+  },
+  
+  # Camera order: 0 -> right wrist, 1 -> left wrist.
+  "cameras": [
+    {
+      "backend": "mvs",
+      "serial": DA9057815, # TODO: fill hardware identifier
+      "width": 480,
+      "height": 480,
+      "fps": 30,
+      "rotate_180": true,
+      "exposure_time": 7500.0,
+      "enable_auto_gain": true,
+      "enable_auto_white_balance": true,
+      "black_level_enable": true,
+      "black_level": 240,
+      "brightness": 40,
+      "sensor_roi": {
+        "enabled": true,
+        "offset_x": 683.8753662109375,
+        "offset_y": 505.6080017089844,
+        "width": 1080,
+        "height": 1080
+      },
+      "receive_latency": 0.0,
+      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+      "sdk_runtime": "/opt/MVS/lib",
+      "launch_timeout": 15,
+      "frame_timeout_ms": 1000,
+      "recording_codec": "libx264"
+    },
+    {
+      "backend": "mvs",
+      "serial": "DA9057798",
+      "width": 480,
+      "height": 480,
+      "fps": 30,
+      "rotate_180": true,
+      "exposure_time": 7500.0,
+      "enable_auto_gain": true,
+      "enable_auto_white_balance": true,
+      "black_level_enable": true,
+      "black_level": 240,
+      "brightness": 40,
+      "sensor_roi": {
+        "enabled": true,
+        "offset_x": 683.7001342773438,
+        "offset_y": 503.6117248535156,
+        "width": 1080,
+        "height": 1080
+      },
+      "receive_latency": 0.0,
+      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+      "sdk_runtime": "/opt/MVS/lib",
+      "launch_timeout": 15,
+      "frame_timeout_ms": 1000,
+      "recording_codec": "libx264"
+    }
+  ],
+
+  # Robot order: 0 -> right, 1 -> left. robot_ip is the NUC address.
+  "robots": [
+    {
+      # right arm
+      "robot_type": "franka",
+      "robot_ip": "172.16.13.171",
+      "robot_port": 4243,
+      "robot_obs_latency": 0.0001,
+      "robot_action_latency": 0.1,
+      "tx_flange_tcp": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.16],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "joints_init": [-1.7364683151245117, 1.4881104230880737, 1.0496121644973755, 
+      -2.6267175674438477, -0.6514298319816589, 3.763932228088379, -1.058779239654541],
+      "joints_init_duration": 5.0,
+      "height_threshold": -0.5,
+      "sphere_radius": 0.1,
+      "sphere_center": [0, 0, -0.06]
+    },
+    {
+      # left arm
+      "robot_type": "franka",
+      "robot_ip": "172.16.13.65",
+      "robot_port": 4243,
+      "robot_obs_latency": 0.0001,
+      "robot_action_latency": 0.1,
+      "tx_flange_tcp": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.16],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "joints_init": [1.1999574899673462, 1.3584938049316406, -0.9573271870613098, 
+      -2.7131645679473877, 0.448293000459671, 4.328459739685059, 1.213373064994812],
+      "joints_init_duration": 5.0,
+      "height_threshold": -0.5,
+      "sphere_radius": 0.1,
+      "sphere_center": [0, 0, -0.06]
+    }
+  ],
+  # One independent single-motor gripper per arm, in the same order.
+  # Existing startup behavior: current motor position is set as zero.
+  "grippers": [
+    {
+      "gripper_type": "custom",
+      "port": "/dev/ttyUSB3",
+      "motor_id": 1,
+      "mode": "single",
+      "width_to_rad": {
+        "min_abs_width_m": 0.04354859789957654,
+        "max_abs_width_m": 0.15072557148528462,
+        "min_rad": 0.0,
+        "max_rad": 3.5,
+      },
+      "initial_position": 0.135,
+      "force_limit_nm": 1.5,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    },
+    {
+      "gripper_type": "custom",
+      "port": "/dev/ttyUSB7",
+      "motor_id": 1,
+      "mode": "single",
+      "width_to_rad": {
+        "min_abs_width_m": 0.0433633813568852,
+        "max_abs_width_m": 0.1537462074079714,
+        "min_rad": 0.0,
+        "max_rad": 3.5,
+      },
+      "initial_position": 0.135,
+      "force_limit_nm": 1.5,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    }
+  ],
+  # transformation right arm's base frame in left arm's base coordinate frame
+  "tx_left_right": null
+}

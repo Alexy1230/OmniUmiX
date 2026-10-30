@@ -1,3 +1,4 @@
+from umi.real_world.gripper_calibration import width_to_rad_parameters
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -20,8 +21,9 @@ class GripperController:
     VELOCITY_P_GAIN = 200.0
     MAX_SPEED_DPS = 60.0
 
-    def __init__(self, mode: str, port1: str, motor1_id: int, port2: str = None, motor2_id: int = None):
+    def __init__(self, mode: str, port1: str, motor1_id: int, port2: str = None, motor2_id: int = None, width_to_rad: dict = None):
 
+        self.width_calibration = width_to_rad_parameters(width_to_rad)
         self.mode = mode
 
         if self.mode not in ['dual', 'single']:
@@ -40,9 +42,13 @@ class GripperController:
         self.KD = 0.01 / 1.5 * 1.5 * self.ratio * 1.0
         self.TORQUE_LIMIT_DUAL = 2.0
         self.TORQUE_LIMIT_SINGLE = 2.0
-        self.DT = 1/ 120.0
+        self.DT = 1/ 50.0
         
         self.MM_PER_SINGLE_MOTOR_RADIAN = 30.0000
+        if self.width_calibration is not None:
+            scale, _, _, upper = self.width_calibration
+            self.MM_PER_SINGLE_MOTOR_RADIAN = 1000.0 / scale
+            self.MOTOR_PHYSICAL_LIMIT_M = min(self.MOTOR_PHYSICAL_LIMIT_M, upper)
 
         self.receive_latency = 0.1
         # 目标位置变化率限制
@@ -86,10 +92,19 @@ class GripperController:
             'gripper_position': np.array(list(self.position_history))
         }
     def _angle_to_width(self, angle_rad: float) -> float:
+        if self.width_calibration is not None:
+            scale, offset, _, _ = self.width_calibration
+            return (angle_rad - offset) / scale
         width_mm = angle_rad * self.MM_PER_SINGLE_MOTOR_RADIAN
         return width_mm / 1000.0  # 移除乘以2，直接返回实际宽度
 
     def _width_to_angle(self, width_m: float) -> float:
+        if self.width_calibration is not None:
+            if not math.isfinite(width_m):
+                raise ValueError('Gripper target width must be finite')
+            scale, offset, lo, hi = self.width_calibration
+            width_m = min(max(width_m, lo), hi, self.MOTOR_PHYSICAL_LIMIT_M)
+            return width_m * scale + offset
         limited_width_m = min(width_m, self.MOTOR_PHYSICAL_LIMIT_M)
         width_mm = limited_width_m * 1000.0  # 移除除以2，直接使用总宽度
         angle_rad = width_mm / self.MM_PER_SINGLE_MOTOR_RADIAN

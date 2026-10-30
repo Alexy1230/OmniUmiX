@@ -5,6 +5,7 @@
 """
 
 import sys
+import argparse
 import os
 
 # 添加项目根目录到 Python 路径
@@ -15,10 +16,15 @@ sys.path.insert(0, project_root)
 import numpy as np
 from umi.real_world.franka_interpolation_controller import FrankaInterface
 
-def main():
-    robot_ip = "172.16.13.65"  # 根据你的配置修改
-    port = 4242
-    
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', type=int, default=4242)
+    parser.add_argument('--ip', type=str, default="172.16.13.65")
+    args = parser.parse_args(argv)
+        
+    robot_ip = args.ip
+    port = args.port
+
     print(f"连接到机器人 {robot_ip}:{port}...")
     robot = FrankaInterface(ip=robot_ip, port=port)
     

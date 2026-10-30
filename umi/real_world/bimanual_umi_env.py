@@ -280,7 +280,8 @@ class BimanualUmiEnv:
             if gripper_type == 'custom':
                 # Each robot has its own single-motor hand and serial port.
                 this_gripper = GripperController(
-                    port1=gc['port'], motor1_id=gc['motor_id'], mode='single')
+                    port1=gc['port'], motor1_id=gc['motor_id'], mode='single',
+                    width_to_rad=gc.get('width_to_rad'))
             elif gripper_type == 'wsg':
                 this_gripper = WSGController(
                     shm_manager=shm_manager,
