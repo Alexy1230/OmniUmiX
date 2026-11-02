@@ -8,7 +8,7 @@ os.chdir(ROOT_DIR)
 
 # %%
 import numpy as np
-from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+from umi.compat.dp.model.common.rotation_transformer import RotationTransformer
 from umi.common.pose_util import rot6d_to_mat, mat_to_rot6d
 
 # %%

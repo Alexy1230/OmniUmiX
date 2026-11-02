@@ -12,7 +12,7 @@ from umi.shared_memory.shared_memory_queue import (
     SharedMemoryQueue, Empty)
 from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
-from diffusion_policy.common.precise_sleep import precise_wait
+from umi.compat.dp.common.precise_sleep import precise_wait
 
 class Command(enum.Enum):
     STOP = 0

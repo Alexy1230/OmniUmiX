@@ -1,15 +1,15 @@
 from typing import Dict, Callable, Tuple, List
 import numpy as np
 import collections
-from diffusion_policy.common.cv2_util import get_image_transform
-from diffusion_policy.common.pose_repr_util import (
+from umi.compat.dp.common.cv2_util import get_image_transform
+from umi.compat.dp.common.pose_repr_util import (
     compute_relative_pose, 
     convert_pose_mat_rep
 )
 from umi.common.pose_util import (
     pose_to_mat, mat_to_pose, 
     mat_to_pose10d, pose10d_to_mat)
-from diffusion_policy.model.common.rotation_transformer import \
+from umi.compat.dp.model.common.rotation_transformer import \
     RotationTransformer
 
 def get_real_obs_resolution(

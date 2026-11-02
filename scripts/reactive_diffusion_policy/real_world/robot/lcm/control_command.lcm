@@ -1,6 +1,0 @@
-package exlcm;
-struct control_command_t
-{
-    int64_t timestamp;
-    double  xyzrpy[6];
-}

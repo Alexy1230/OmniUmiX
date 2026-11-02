@@ -43,6 +43,9 @@ def policy_options(config, num_robots):
         raise ValueError('policy.image_keys needs one distinct request key per arm, in robot list order')
     if not isinstance(result['state_key'], str) or not result['state_key']:
         raise ValueError('state_key must be a nonempty string')
+    if result['state_key'] == 'prompt' or any(
+            key in (result['state_key'], 'prompt') for key in keys):
+        raise ValueError('Image, state and prompt request keys must be distinct')
     return result
 
 

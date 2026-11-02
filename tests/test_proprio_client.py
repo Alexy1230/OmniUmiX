@@ -83,3 +83,23 @@ def test_single_server_rejected_for_dual_client():
         raise AssertionError('Single-arm model accepted for dual-arm deployment')
     client.metadata.update(state_dim=64,num_robots=2,arm_order=['right','left'])
     client.validate_contract()
+
+
+def test_paired_history_preserves_time_order_and_arm_order(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    # Images already have the requested size; isolate timing/packing from OpenCV.
+    monkeypatch.setitem(sys.modules, 'cv2', SimpleNamespace(
+        INTER_AREA=3, resize=lambda image, size, interpolation: image.copy()))
+    from umi.real_world.proprio_policy_client import paired_history
+    obs = {}
+    for arm in range(2):
+        obs[f'camera{arm}_rgb'] = np.stack([np.full((4,4,3), 10+arm, np.uint8),
+                                           np.full((4,4,3), 20+arm, np.uint8)])
+        obs[f'robot{arm}_eef_pos'] = np.array([[arm,0,0],[arm+0.5,0,0]])
+        obs[f'robot{arm}_eef_rot_axis_angle'] = np.zeros((2,3))
+        obs[f'robot{arm}_gripper_width'] = np.array([[.01],[.02]])
+    images, history = paired_history(obs, 4, [1,1], {}, count=2)
+    np.testing.assert_array_equal(history[:, [0,10]], [[0,1],[.5,1.5]])
+    assert [int(im[0,0,0]) for im in images] == [10,11]
+    np.testing.assert_allclose(history[:, [9,19]], [[.01,.01],[.02,.02]])

@@ -9,14 +9,14 @@ from umi.real_world.rtde_interpolation_controller import RTDEInterpolationContro
 from umi.real_world.wsg_controller import WSGController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
-from diffusion_policy.common.timestamp_accumulator import (
+from umi.compat.dp.common.timestamp_accumulator import (
     TimestampActionAccumulator,
     ObsAccumulator
 )
 from umi.common.cv_util import draw_predefined_mask
 from umi.real_world.multi_camera_visualizer import MultiCameraVisualizer
-from diffusion_policy.common.replay_buffer import ReplayBuffer
-from diffusion_policy.common.cv2_util import (
+from umi.compat.dp.common.replay_buffer import ReplayBuffer
+from umi.compat.dp.common.cv2_util import (
     get_image_transform, optimal_row_cols)
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
@@ -574,7 +574,13 @@ class BimanualUmiEnv:
 
         # convert action to pose
         receive_time = time.time()
-        is_new = timestamps > receive_time
+        delivery_latency = 0.0
+        if compensate_latency:
+            delivery_latency = max(
+                [0.0] + [float(rc['robot_action_latency']) for rc in self.robots_config]
+                + [float(gc['gripper_action_latency']) for gc in self.grippers_config
+                   if gc.get('gripper_type', 'wsg') != 'custom'])
+        is_new = timestamps > receive_time + delivery_latency
         new_actions = actions[is_new]
         new_timestamps = timestamps[is_new]
 

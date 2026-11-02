@@ -123,12 +123,13 @@ def test_duplicate_endpoints_and_ports_rejected():
 
 
 @pytest.mark.parametrize('entry', ['policy_client_pi.py', 'policy_client_pi_episodes.py'])
-def test_sphere_correction_uses_legacy_offset(entry):
+def test_sphere_correction_uses_configured_offset(entry):
     solve = load_sphere_collision(entry)
-    poses = np.array([[0., .80, 0, 0, 0, 0], [0., .01, 0, 0, 0, 0]])
+    offset = .635 if entry == 'policy_client_pi_episodes.py' else .89
+    poses = np.array([[0., offset - .09, 0, 0, 0, 0], [0., .01, 0, 0, 0, 0]])
     robots = [dict(sphere_radius=.1, sphere_center=[0, 0, 0])] * 2
     solve(poses, robots)
-    np.testing.assert_allclose(poses[0, :3], [0, .75, 0])
+    np.testing.assert_allclose(poses[0, :3], [0, offset - .14, 0])
     np.testing.assert_allclose(poses[1, :3], [0, .06, 0])
     np.testing.assert_allclose(poses[:, 3:], 0)
 
@@ -452,7 +453,7 @@ def test_sphere_single_arm_zero_radii_and_coincident_centers(entry):
     robots = [dict(sphere_radius=.1, sphere_center=[0, 0, 0])] * 2
     solve(poses[:1], robots[:1])
     solve(poses, [dict(sphere_radius=0, sphere_center=[0, 0, 0])] * 2)
-    poses[0, 1] = .89
+    poses[0, 1] = .635 if entry == 'policy_client_pi_episodes.py' else .89
     with pytest.raises(ValueError, match='coincide'):
         solve(poses, robots)
 

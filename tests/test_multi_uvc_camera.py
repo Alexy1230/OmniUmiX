@@ -14,7 +14,7 @@ from umi.real_world.multi_uvc_camera import MultiUvcCamera
 from umi.real_world.multi_camera_visualizer import MultiCameraVisualizer
 from umi.real_world.video_recorder import VideoRecorder
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
-from diffusion_policy.common.cv2_util import (
+from umi.compat.dp.common.cv2_util import (
     get_image_transform, optimal_row_cols)
 
 def test():

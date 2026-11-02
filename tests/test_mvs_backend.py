@@ -199,7 +199,7 @@ def fork_workers(monkeypatch):
     if sys.platform == 'darwin':
         for name in ['umi.shared_memory.shared_memory_ring_buffer',
                      'umi.shared_memory.shared_memory_queue',
-                     'diffusion_policy.shared_memory.shared_memory_queue']:
+                     'umi.compat.dp.shared_memory.shared_memory_queue']:
             monkeypatch.setattr(importlib.import_module(name), 'SharedAtomicCounter', LockedTestCounter)
     yield
     mp.set_start_method(previous, force=True)

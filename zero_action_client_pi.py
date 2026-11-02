@@ -50,11 +50,11 @@ from umi.real_world.bimanual_umi_env import BimanualUmiEnv
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
 from umi.common.precise_sleep import precise_wait
 from umi.common.pose_util import pose_to_mat, mat_to_pose
-from reactive_diffusion_policy.common.space_utils import (
+from umi.compat.rdp.common.space_utils import (
     ortho6d_to_rotation_matrix,
     pose_6d_to_pose_9d,
 )
-from reactive_diffusion_policy.common.action_utils import (
+from umi.compat.rdp.common.action_utils import (
     relative_actions_to_absolute_actions,
 )
 from umi.common import openpi_msgpack_numpy
