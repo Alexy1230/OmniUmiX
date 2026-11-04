@@ -24,10 +24,10 @@ def main():
     import numpy as np
     import yaml
     from umi.real_world.mvs_camera import MultiMvsCamera
-    from umi.real_world.mvs_camera_config import normalize_mvs_configs, MvsImageTransform
+    from umi.real_world.mvs_camera_config import camera_configs_from_yaml, normalize_mvs_configs, MvsImageTransform
 
     with open(args.config) as stream:
-        configs = normalize_mvs_configs(yaml.safe_load(stream)['cameras'])
+        configs = normalize_mvs_configs(camera_configs_from_yaml(yaml.safe_load(stream)))
     observed = [[] for _ in configs]
 
     with SharedMemoryManager() as manager:

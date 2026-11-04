@@ -138,19 +138,36 @@ class MvsCapture:
             # rate too, so a faster sensor cannot build an old-frame backlog.
             self._bool('AcquisitionFrameRateEnable', True)
             self._float('AcquisitionFrameRate', self.config['fps'])
-            exposure = self.config.get('exposure_time')
-            if exposure is not None:
-                self._enum('ExposureAuto', sdk.MV_EXPOSURE_AUTO_MODE_OFF)
-                self._float('ExposureTime', exposure)
-            self._enum('GainAuto', sdk.MV_GAIN_MODE_CONTINUOUS
-                       if self.config.get('enable_auto_gain', True) else sdk.MV_GAIN_MODE_OFF)
-            self._enum('BalanceWhiteAuto', sdk.MV_BALANCEWHITE_AUTO_CONTINUOUS
-                       if self.config.get('enable_auto_white_balance', True) else sdk.MV_BALANCEWHITE_AUTO_OFF)
-            if 'black_level_enable' in self.config:
-                self._bool('BlackLevelEnable', self.config['black_level_enable'])
-            for key, feature in [('black_level', 'BlackLevel'), ('brightness', 'Brightness')]:
-                if self.config.get(key) is not None:
-                    self._check(self.camera.MV_CC_SetIntValue(feature, int(self.config[key])), feature)
+            if 'exposure_auto' in self.config:
+                # Match collection camera_mvs.py: gain, brightness/limit, exposure.
+                gain = self.config.get('gain_auto', 'continuous')
+                self._enum('GainAuto', {'off': 0, 'once': 1, 'continuous': 2}[gain])
+                if self.config['exposure_auto']:
+                    for name, value in [('Brightness', int(self.config.get('target_brightness', 40))),
+                                        ('AutoExposureTimeUpperLimit', int(900000 // self.config['fps']))]:
+                        limits = sdk.MVCC_INTVALUE_EX()
+                        self._check(self.camera.MV_CC_GetIntValueEx(name, limits), 'get '+name)
+                        if not limits.nMin <= value <= limits.nMax:
+                            raise ValueError(f'{name}={value} outside camera range {limits.nMin}..{limits.nMax}')
+                        self._check(self.camera.MV_CC_SetIntValueEx(name, value), name)
+                    self._enum('ExposureAuto', 2)
+                else:
+                    self._enum('ExposureAuto', 0)
+                    self._float('ExposureTime', self.config.get('exposure_time', 12500))
+            else:
+                exposure = self.config.get('exposure_time')
+                if exposure is not None:
+                    self._enum('ExposureAuto', sdk.MV_EXPOSURE_AUTO_MODE_OFF)
+                    self._float('ExposureTime', exposure)
+                self._enum('GainAuto', sdk.MV_GAIN_MODE_CONTINUOUS
+                           if self.config.get('enable_auto_gain', True) else sdk.MV_GAIN_MODE_OFF)
+                self._enum('BalanceWhiteAuto', sdk.MV_BALANCEWHITE_AUTO_CONTINUOUS
+                           if self.config.get('enable_auto_white_balance', True) else sdk.MV_BALANCEWHITE_AUTO_OFF)
+                if 'black_level_enable' in self.config:
+                    self._bool('BlackLevelEnable', self.config['black_level_enable'])
+                for key, feature in [('black_level', 'BlackLevel'), ('brightness', 'Brightness')]:
+                    if self.config.get(key) is not None:
+                        self._check(self.camera.MV_CC_SetIntValue(feature, int(self.config[key])), feature)
             self._check(self.camera.MV_CC_StartGrabbing(), 'start grabbing')
             self.grabbing = True
             return self
@@ -192,8 +209,9 @@ class MvsCapture:
             image = np.ctypeslib.as_array(buffer).reshape(height, width, 3)
             # Collection stores rotated frames; convert_dataset.py crops those.
             # Thus calibration center coordinates must be applied AFTER rotation.
-            if self.config.get('rotate_180', True):
-                image = cv2.rotate(image, cv2.ROTATE_180)
+            rotation = self.config.get('rotation', 180 if self.config.get('rotate_180', True) else 0)
+            if rotation:
+                image = cv2.rotate(image, {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotation])
             if self._software_roi is not None:
                 image = crop_with_black_padding(image, self._software_roi)
             image = cv2.resize(image, (self.config['width'], self.config['height']),

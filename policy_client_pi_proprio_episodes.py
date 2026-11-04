@@ -235,7 +235,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
     robots_config = robot_config_data['robots']
     grippers_config = robot_config_data['grippers']
-    cameras_config = robot_config_data.get('cameras')
+    from umi.real_world.mvs_camera_config import camera_configs_from_yaml
+    cameras_config = camera_configs_from_yaml(robot_config_data)
     num_robots = len(robots_config)
     validate_hardware_config(robots_config, grippers_config)
     options = policy_options(policy_config, num_robots)

@@ -13,26 +13,33 @@
     "model_to_hardware_gripper_scale": 0.03
   },
   # Direct MVS USB camera; adjust serial for your unit.
-  "cameras": [
-    {
-      "backend": "mvs", "serial": "DA9057798",
-      # "backend": "mvs", "serial": "DA9057815",
-      "width": 480, "height": 480, "fps": 30,
-      "rotate_180": true,
-      "exposure_time": 7500.0,
-      "enable_auto_gain": true, "enable_auto_white_balance": true,
-      "black_level_enable": true, "black_level": 240, "brightness": 40,
-      # Software ROI: offset_x/offset_y are CENTER coordinates AFTER rotation, matching calibration fisheye_crop.
-      # At 1440x1080 bounds center (720,720) pads 180 bottom rows in the final orientation.
-      "sensor_roi": {"enabled": true, "offset_x": 720, "offset_y": 720, "width": 1080, "height": 1080},
-      # Host receipt timestamp minus this delay; calibrate for this computer/camera.
-      "receive_latency": 0.0,
-      "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
-      "sdk_runtime": "/opt/MVS/lib",
-      "launch_timeout": 15, "frame_timeout_ms": 1000,
-      "recording_codec": "libx264"
+  "mvs": {
+    "right_hand": {
+        "backend": "mvs",
+        "serial": "DA9057798",
+        "width": 480,
+        "height": 480,
+        "fps": 30,
+        "exposure_time": 12500,
+        "sensor_roi": {
+            "enabled": true,
+            "offset_x": 720,
+            "offset_y": 720,
+            "width": 1080,
+            "height": 1080
+        },
+        "receive_latency": 0.0,
+        "sdk_path": "/opt/MVS/Samples/64/Python/MvImport",
+        "sdk_runtime": "/opt/MVS/lib",
+        "launch_timeout": 15,
+        "frame_timeout_ms": 1000,
+        "recording_codec": "libx264",
+        "target_brightness": 40,
+        "exposure_auto": true,
+        "gain_auto": "continuous",
+        "rotation": 180
     }
-  ],
+},
   # robot configurations, 0->right 1->left
   # comment out robot #1 if only using 1 arm
   "robots": [

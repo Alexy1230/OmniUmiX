@@ -40,7 +40,7 @@ def main(argv=None):
     import cv2
     import numpy as np
     import yaml
-    from umi.real_world.mvs_camera_config import normalize_mvs_configs
+    from umi.real_world.mvs_camera_config import camera_configs_from_yaml, normalize_mvs_configs
     from umi.real_world.mvs_camera_service import IsolatedMultiMvsCamera
 
     with Path(args.config).expanduser().open() as stream:
@@ -50,7 +50,7 @@ def main(argv=None):
     if resolution <= 0:
         parser.error('image resolution must be positive')
     order = None if args.camera_reorder is None else [int(x) for x in args.camera_reorder.split(',')]
-    configs = normalize_mvs_configs(config['cameras'], order)
+    configs = normalize_mvs_configs(camera_configs_from_yaml(config), order)
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix='camera_', dir=output))

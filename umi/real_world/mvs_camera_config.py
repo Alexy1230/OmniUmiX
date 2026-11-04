@@ -65,3 +65,34 @@ class MvsImageTransform:
             image = image.astype(np.float32) / 255.0
         data['color'] = np.ascontiguousarray(image)
         return data
+
+
+def camera_configs_from_yaml(config):
+    """Collection-style per-hand cameras, ordered right then left."""
+    if 'mvs' not in config:
+        return config.get('cameras')
+    if 'cameras' in config:
+        raise ValueError('Specify mvs or cameras, not both')
+    cameras = config['mvs']
+    if not isinstance(cameras, dict) or not cameras or set(cameras) - {'right_hand', 'left_hand'}:
+        raise ValueError('mvs must contain right_hand and optionally left_hand')
+    if 'right_hand' not in cameras:
+        raise ValueError('Single arm uses mvs.right_hand')
+    result = []
+    for name in ('right_hand', 'left_hand'):
+        if name not in cameras:
+            continue
+        item = dict(cameras[name])
+        item.setdefault('exposure_auto', True)
+        item.setdefault('target_brightness', 40)
+        item.setdefault('gain_auto', 'continuous')
+        item.setdefault('exposure_time', 12500)
+        item.setdefault('rotation', 180)
+        if not isinstance(item['exposure_auto'], bool):
+            raise ValueError('exposure_auto must be a YAML boolean')
+        if item['gain_auto'] not in ('off', 'once', 'continuous'):
+            raise ValueError('gain_auto must be off, once or continuous (quote off in YAML)')
+        if item['rotation'] not in (0, 90, 180, 270):
+            raise ValueError('rotation must be 0, 90, 180 or 270')
+        result.append(item)
+    return result
