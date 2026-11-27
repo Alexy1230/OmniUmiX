@@ -1,0 +1,211 @@
+# RTC client template, seeded from eval_pi05_bimanual_pick_cup_rod.yaml.
+# Robot/camera/gripper lists remain in UMI order: RIGHT, then LEFT.
+# For one arm, keep only the first entry in EACH list and use a single-arm checkpoint.
+# Verify copied endpoints, serials, calibration, TCP transforms and initial joints.
+# This template deliberately time-scales a 30 Hz checkpoint to 15 Hz execution.
+# Start the server with --fps 30 --execution-fps 15. The client validates both.
+#
+# From the client directory (fresh output directory required):
+# python policy_client_pi_rtc.py --robot-config example/eval_pi05_rtc.yaml \
+#   --output data_local/rtc_run_001
+# A single-arm proprio checkpoint uses policy_client_pi_proprio_rtc.py and keeps
+# only the first camera, robot, and gripper entries.
+# Add --execute for live policy execution. No YAML flag enables execution.
+# Debug mode still starts holding controllers and the existing gripper zero reset.
+#
+# CLI arguments override YAML. Old YAML without rtc retains the previous defaults.
+# No exec_horizon_steps: RTC retains the full plan and commits a short horizon.
+# Server --config, --checkpoint, --num-steps and --max-guidance are set separately
+# on serve_policy_rtc.py. --fps checks training metadata; --execution-fps sets
+# the rate used to timestamp and execute action rows.
+# Existing sphere-collision inter-base transform is defined in the episode helper;
+# tx_left_right below does not override that function.
+
+policy:
+  server_url: ws://127.0.0.1:8099
+  prompt: Pick up the red cup with the left arm and place it on the yellow plate.
+    Then, pick up the white rod with the right arm and place it inside the red cup.
+  request_timeout_s: 30.0
+  control_fps: 15.0
+  # Used only by policy_client_pi_proprio_rtc.py; must match training history_steps/fps.
+  proprio_history_seconds: 0.1
+  image_resolution: 240
+  action_is_relative: false
+# All durations below are seconds; step counts use policy.control_fps.
+
+rtc:
+  # Minimum interval between request starts; execution continues during inference.
+  # Four steps at 15 Hz keeps the original ~0.267 second replanning interval.
+  steps_per_inference: 4
+  # Initial steady-state request/inference estimate, after warmup.
+  initial_delay: 0.2
+  # Added to measured latency for subsequent prefix lengths.
+  delay_margin: 0.05
+  # Extra lead beyond the largest robot/gripper action latency.
+  delivery_margin: 0.05
+  # Maximum final-target hold beyond an accepted plan before erroring.
+  max_hold: 0.5
+  # Episode limits (S can also end an episode).
+  max_duration: 30.0
+  max_timesteps: 600
+
+cameras:
+- backend: mvs
+  serial: DA9057815
+  source_width: 1440
+  source_height: 1080
+  width: 240
+  height: 240
+  resize_interpolation: lanczos
+  fps: 30
+  rotate_180: true
+  exposure_time: 7500.0
+  enable_auto_gain: true
+  enable_auto_white_balance: true
+  black_level_enable: true
+  black_level: 240
+  brightness: 40
+  sensor_roi:
+    enabled: true
+    offset_x: 720
+    offset_y: 540
+    width: 1080
+    height: 1080
+  receive_latency: 0.0
+  sdk_path: /opt/MVS/Samples/64/Python/MvImport
+  sdk_runtime: /opt/MVS/lib
+  launch_timeout: 15
+  frame_timeout_ms: 1000
+  recording_codec: libx264
+- backend: mvs
+  serial: DA9057798
+  source_width: 1440
+  source_height: 1080
+  width: 240
+  height: 240
+  resize_interpolation: lanczos
+  fps: 30
+  rotate_180: true
+  exposure_time: 7500.0
+  enable_auto_gain: true
+  enable_auto_white_balance: true
+  black_level_enable: true
+  black_level: 240
+  brightness: 40
+  sensor_roi:
+    enabled: true
+    offset_x: 720
+    offset_y: 540
+    width: 1080
+    height: 1080
+  receive_latency: 0.0
+  sdk_path: /opt/MVS/Samples/64/Python/MvImport
+  sdk_runtime: /opt/MVS/lib
+  launch_timeout: 15
+  frame_timeout_ms: 1000
+  recording_codec: libx264
+
+robots:
+- robot_type: franka
+  robot_ip: 172.16.13.171
+  robot_port: 4243
+  robot_obs_latency: 0.0001
+  robot_action_latency: 0.1
+  tx_flange_tcp:
+  - - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 0.0
+    - 1.0
+    - 0.16
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  joints_init:
+  - -1.7364683151245117
+  - 1.4881104230880737
+  - 1.0496121644973755
+  - -2.6267175674438477
+  - -0.6514298319816589
+  - 3.763932228088379
+  - -1.058779239654541
+  joints_init_duration: 5.0
+  height_threshold: -0.5
+  sphere_radius: 0.1
+  sphere_center:
+  - 0
+  - 0
+  - -0.06
+- robot_type: franka
+  robot_ip: 172.16.13.65
+  robot_port: 4243
+  robot_obs_latency: 0.0001
+  robot_action_latency: 0.1
+  tx_flange_tcp:
+  - - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 0.0
+    - 1.0
+    - 0.16
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  joints_init:
+  - 1.1999574899673462
+  - 1.3584938049316406
+  - -0.9573271870613098
+  - -2.7131645679473877
+  - 0.448293000459671
+  - 4.328459739685059
+  - 1.213373064994812
+  joints_init_duration: 5.0
+  height_threshold: -0.5
+  sphere_radius: 0.1
+  sphere_center:
+  - 0
+  - 0
+  - -0.06
+  
+grippers:
+- gripper_type: custom
+  port: /dev/ttyUSB3
+  motor_id: 1
+  mode: single
+  width_to_rad:
+    min_abs_width_m: 0.04354859789957654
+    max_abs_width_m: 0.15072557148528462
+    min_rad: 0.0
+    max_rad: 3.5
+  initial_position: 0.135
+  force_limit_nm: 1.5
+  gripper_obs_latency: 0.01
+  gripper_action_latency: 0.1
+- gripper_type: custom
+  port: /dev/ttyUSB7
+  motor_id: 1
+  mode: single
+  width_to_rad:
+    min_abs_width_m: 0.0433633813568852
+    max_abs_width_m: 0.1537462074079714
+    min_rad: 0.0
+    max_rad: 3.5
+  initial_position: 0.135
+  force_limit_nm: 1.5
+  gripper_obs_latency: 0.01
+  gripper_action_latency: 0.1
+tx_left_right: null
