@@ -28,15 +28,15 @@ class FakeMotor:
     def set_zero_ram(self): self.calls.append('zero')
     def set_torque_nm(self, value): self.calls.append(('torque', value))
 
-motor = ModuleType('motor.motor')
-motor.LkMotor = FakeMotor
+adapter = ModuleType('umi.real_world.lk_motor_adapter')
+adapter.LkMotor = FakeMotor
 protocol = ModuleType('motor.protocol')
 protocol.radian_to_degree = lambda x: x * 180 / 3.1415926
 logger = ModuleType('loguru')
 logger.logger = SimpleNamespace(info=lambda *a: None)
 spec = importlib.util.spec_from_file_location('real_controller', ROOT / 'umi/real_world/gripper_controller_1_14.py')
 driver = importlib.util.module_from_spec(spec)
-with patch.dict(sys.modules, {'motor': ModuleType('motor'), 'motor.motor': motor,
+with patch.dict(sys.modules, {'motor': ModuleType('motor'), 'umi.real_world.lk_motor_adapter': adapter,
                              'motor.protocol': protocol, 'loguru': logger}):
     spec.loader.exec_module(driver)
 

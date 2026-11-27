@@ -15,6 +15,8 @@ import warnings
 import cv2
 import numpy as np
 
+from umi.real_world.mvs_camera_config import resize_image
+
 
 def crop_with_black_padding(image, config):
     """Crop in rotated-frame coordinates; missing pixels become zero BGR.
@@ -75,8 +77,10 @@ class MvsCapture:
             ) from exc
 
     def _configure_roi(self):
-        """Always acquire 1440x1080; sensor_roi now controls software cropping."""
+        """Acquire the declared native frame; sensor_roi controls software cropping."""
         self._software_roi = None
+        source_width = int(self.config.get('source_width', 1440))
+        source_height = int(self.config.get('source_height', 1080))
         roi = self.config.get('sensor_roi', {})
         if roi.get('enabled', False):
             values = [roi.get('offset_x', 720), roi.get('offset_y', 540),
@@ -90,17 +94,24 @@ class MvsCapture:
             if width <= 0 or height <= 0:
                 raise ValueError('sensor_roi width and height must be positive')
             x, y = x - width // 2, y - height // 2
-            if x >= 1440 or y >= 1080 or x + width <= 0 or y + height <= 0:
-                raise ValueError('sensor_roi does not overlap the 1440x1080 capture frame')
+            if (x >= source_width or y >= source_height
+                    or x + width <= 0 or y + height <= 0):
+                raise ValueError(
+                    f'sensor_roi does not overlap the {source_width}x{source_height} capture frame'
+                )
             self._software_roi = dict(roi)
             self._software_roi.setdefault('offset_x', 720)
             self._software_roi.setdefault('offset_y', 540)
         # Clear any ROI retained from a previous camera program. User crop
         # coordinates are never sent to the SDK, so pixel offsets like 158 work.
         for name, value in [('OffsetX', 0), ('OffsetY', 0),
-                            ('Width', 1440), ('Height', 1080)]:
+                            ('Width', source_width), ('Height', source_height)]:
             self._check(self.camera.MV_CC_SetIntValue(name, value), name)
-        print(f'MVS capture: 1440x1080; software sensor_roi={self._software_roi}', flush=True)
+        print(
+            f'MVS capture: {source_width}x{source_height}; '
+            f'software sensor_roi={self._software_roi}',
+            flush=True,
+        )
 
     def open(self):
         if self.sdk is None:
@@ -193,8 +204,15 @@ class MvsCapture:
         received = time.time()
         try:
             width, height = frame.stFrameInfo.nWidth, frame.stFrameInfo.nHeight
-            if (width, height) != (1440, 1080):
-                raise RuntimeError(f'MVS returned {width}x{height}; expected 1440x1080 before software crop')
+            expected = (
+                int(self.config.get('source_width', 1440)),
+                int(self.config.get('source_height', 1080)),
+            )
+            if (width, height) != expected:
+                raise RuntimeError(
+                    f'MVS returned {width}x{height}; expected '
+                    f'{expected[0]}x{expected[1]} before software crop'
+                )
             buffer = (ct.c_ubyte * (width * height * 3))()
             conversion = sdk.MV_CC_PIXEL_CONVERT_PARAM_EX()
             conversion.nWidth, conversion.nHeight = width, height
@@ -214,8 +232,12 @@ class MvsCapture:
                 image = cv2.rotate(image, {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotation])
             if self._software_roi is not None:
                 image = crop_with_black_padding(image, self._software_roi)
-            image = cv2.resize(image, (self.config['width'], self.config['height']),
-                               interpolation=cv2.INTER_LINEAR)
+            output_size = (self.config['width'], self.config['height'])
+            if image.shape[1::-1] != output_size:
+                image = resize_image(
+                    image, output_size,
+                    self.config.get('resize_interpolation', 'linear'),
+                )
             return np.ascontiguousarray(image).copy(), received
         finally:
             self.camera.MV_CC_FreeImageBuffer(frame)

@@ -1,7 +1,6 @@
 # python policy_client_pi_episodes.py \
 #   --robot-config example/eval_pi05_bimanual_pick_cup_rod.yaml \
 #   --output data_local/bimanual_debug \
-#   --debug-actions --save-policy-data \
 #   --max-duration 20 --max-timesteps 100
 
 {
@@ -23,14 +22,17 @@
     "right_hand": {
         "backend": "mvs",
         "serial": "DA9057815",
-        "width": 480,
-        "height": 480,
+        "source_width": 1440,
+        "source_height": 1080,
+        "width": 240,
+        "height": 240,
+        "resize_interpolation": "lanczos",
         "fps": 30,
         "exposure_time": 12500,
         "sensor_roi": {
             "enabled": true,
-            "offset_x": 683.8753662109375,
-            "offset_y": 505.6080017089844,
+            "offset_x": 720,
+            "offset_y": 540,
             "width": 1080,
             "height": 1080
         },
@@ -48,14 +50,17 @@
     "left_hand": {
         "backend": "mvs",
         "serial": "DA9057798",
-        "width": 480,
-        "height": 480,
+        "source_width": 1440,
+        "source_height": 1080,
+        "width": 240,
+        "height": 240,
+        "resize_interpolation": "lanczos",
         "fps": 30,
         "exposure_time": 12500,
         "sensor_roi": {
             "enabled": true,
-            "offset_x": 683.7001342773438,
-            "offset_y": 503.6117248535156,
+            "offset_x": 720,
+            "offset_y": 540,
             "width": 1080,
             "height": 1080
         },

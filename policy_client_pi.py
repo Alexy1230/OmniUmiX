@@ -6,7 +6,6 @@ import os
 import sys
 import time
 import atexit
-import json
 import yaml
 import click
 import cv2
@@ -24,6 +23,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
 from umi.real_world.bimanual_umi_env import BimanualUmiEnv
+from umi.real_world.client_deployment import action_delivery_margin, warmup_pi
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
 from umi.common.precise_sleep import precise_wait
 from umi.common.pose_util import pose_to_mat, mat_to_pose
@@ -109,18 +109,6 @@ def rpy_to_axis_angle(rpy: np.ndarray) -> np.ndarray:
 
 
 def finish_episode_recording(env):
-    """Avoid the environment's timestamps[-1] on a trial with no actions."""
-    if env.obs_accumulator is None:
-        return
-    actions = env.action_accumulator
-    obs_times = env.obs_accumulator.timestamps
-    if (actions is None or len(actions.timestamps) == 0
-            or not obs_times or any(len(t) == 0 for t in obs_times.values())):
-        env.camera.stop_recording()
-        env.obs_accumulator = None
-        env.action_accumulator = None
-        print('[Episode] No complete observation/action samples; replay entry skipped.', flush=True)
-        return
     env.end_episode()
 
 # ============ 主函数 ============
@@ -133,8 +121,6 @@ def finish_episode_recording(env):
 @click.option('--robot-config', '-rc', required=True, help='Path to robot_config yaml file')
 @click.option('--camera-reorder', '-cr', default=None, help='Optional comma-separated camera indices')
 @click.option('--vis-camera-idx', default=0, type=int, help='Which camera to visualize')
-@click.option('--save-policy-data', is_flag=True, help='Save exact request image/state and returned actions; does not disable motion.')
-@click.option('--debug-actions', is_flag=True, help='Inspect and log predictions; do not submit policy actions or request homing/initial gripper movement. Controllers still start.')
 @click.option('--init-joints', '-j', is_flag=True, default=False, help='Initialize robot to home position')
 @click.option('--steps-per-inference', '-si', default=1, type=int, help='Submit a new chunk every N loop iterations; inference still runs each iteration')
 @click.option('--max-duration', '-md', default=2000000, type=float, help='Max duration per episode (seconds)')
@@ -150,11 +136,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
          camera_reorder, vis_camera_idx, init_joints,
          steps_per_inference, max_duration, max_timesteps,
          frequency, obs_image_resolution, exec_horizon_steps, no_mirror, mirror_swap,
-         temporal_agg, ensemble_steps, debug_actions, save_policy_data):
+         temporal_agg, ensemble_steps):
 
-    if debug_actions:
-        init_joints = False
-        print("DEBUG: no policy targets, homing, or initial gripper move. Environment still enables holding controllers and resets gripper zero.")
 
     # 加载机器人配置
     robot_config_data = yaml.safe_load(open(os.path.expanduser(robot_config), 'r'))
@@ -222,32 +205,6 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout,
                                  num_robots=num_robots, policy_config=policy_config)
     atexit.register(policy_client.close)
-    capture_dir = None
-    capture_idx = 0
-    if save_policy_data:
-        import tempfile
-        capture_root = os.path.join(os.path.expanduser(output), 'policy_io')
-        os.makedirs(capture_root, exist_ok=True)
-        capture_dir = tempfile.mkdtemp(prefix='run_', dir=capture_root)
-        print(f"Policy request/response files: {capture_dir}")
-        with open(os.path.join(capture_dir, 'metadata.json'), 'w') as capture_file:
-            json.dump(dict(
-                robot_config=robot_config_data, server_metadata=policy_client.metadata,
-                server_url=server_url, prompt=prompt, action_is_relative=action_is_relative,
-                frequency=frequency, exec_horizon_steps=exec_horizon_steps,
-                steps_per_inference=steps_per_inference, debug_actions=debug_actions,
-                image_resolution=obs_image_resolution,
-                hardware_to_model_gripper_scale=hardware_to_model_gripper_scale.tolist(),
-                model_to_hardware_gripper_scale=model_to_hardware_gripper_scale.tolist(),
-                hardware_to_model_gripper_offset=options['hardware_to_model_gripper_offset'],
-                model_to_hardware_gripper_offset=options['model_to_hardware_gripper_offset'],
-            ), capture_file, indent=2, default=str)
-    debug_path = os.path.join(os.path.expanduser(output), 'action_debug.jsonl')
-    if debug_actions:
-        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
-        print(f"Action diagnostics: {debug_path}")
-        print(f"Server metadata: {policy_client.metadata}")
-        print(f"Configured relative actions: {action_is_relative}; TCP transform: {[rc.get('tx_flange_tcp') for rc in robots_config]}")
 
     # 设置下采样步数（默认值）
     down_sample_steps = 1
@@ -257,6 +214,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
         with KeystrokeCounter() as key_counter, \
             BimanualUmiEnv(
                 output_dir=output,
+                video_only=True,
                 robots_config=robots_config,
                 grippers_config=grippers_config,
                 frequency=frequency,
@@ -288,20 +246,25 @@ def main(server_url, prompt, request_timeout, output, robot_config,
             time.sleep(1.0)
 
             # ========== 机器人初始化 ==========
-            if not debug_actions:
-                for i, gc in enumerate(grippers_config):
-                    if 'initial_position' in gc:
-                        if gc.get('gripper_type', 'wsg') == 'custom':
-                            env.grippers[i].move_gripper(width_m=float(gc['initial_position']), force_limit_nm=float(gc.get('force_limit_nm', 1.5)))
-                        else:
-                            env.grippers[i].schedule_waypoint(pos=float(gc['initial_position']), target_time=time.time() + 0.5)
-                time.sleep(1.5)
+            for i, gc in enumerate(grippers_config):
+                if 'initial_position' in gc:
+                    if gc.get('gripper_type', 'wsg') == 'custom':
+                        env.grippers[i].move_gripper(width_m=float(gc['initial_position']), force_limit_nm=float(gc.get('force_limit_nm', 1.5)))
+                    else:
+                        env.grippers[i].schedule_waypoint(pos=float(gc['initial_position']), target_time=time.time() + 0.5)
+            time.sleep(1.5)
 
             if init_joints:
                 print("Robot initialized at the configured home joints.")
 
 
             print("\n" + "=" * 60)
+            if not warmup_pi(
+                env, policy_client, obs_image_resolution, hardware_to_model_gripper_scale, options,
+                lambda: {key.char for key in key_counter.get_press_events() if isinstance(key, KeyCode)},
+            ):
+                return
+
             print("Ready! Press 'C' to start policy, 'Q' to quit")
             print("=" * 60)
 
@@ -384,43 +347,24 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             obs, num_robots, obs_image_resolution,
                             hardware_to_model_gripper_scale, options)
 
-                        capture_prefix = None
-                        if capture_dir is not None:
-                            capture_prefix = os.path.join(capture_dir, f'{capture_idx:06d}')
-                            capture_idx += 1
-                            np.savez(capture_prefix + '_input.npz',
-                                     images_rgb=np.stack(images), state=current_state,
-                                     measured_poses6=current_poses6, gripper_widths_m=current_widths,
-                                     observation_timestamps=np.asarray(obs_timestamps),
-                                     prompt=np.asarray(prompt), step=np.asarray(iter_idx))
-                            for i, image in enumerate(images):
-                                if not cv2.imwrite(capture_prefix + f'_camera{i}.png', image[..., ::-1]):
-                                    raise IOError('Could not save policy input image')
 
                         # 调用服务器获取动作
                         s = time.time()
                         raw_action = policy_client.call_server(images, current_state)
                         response_received_at = time.time()
-                        if capture_prefix is not None:
-                            np.savez(
-                                capture_prefix + '_response.npz',
-                                actions=np.asarray(raw_action) if raw_action is not None else np.empty((0, 10 * num_robots), dtype=np.float32),
-                                response_valid=np.asarray(raw_action is not None),
-                                request_started_at=np.asarray(s),
-                                response_received_at=np.asarray(response_received_at),
-                            )
-                        
-                        # print(f"DEBUG: raw_action type: {type(raw_action)}")
-                        # print(f"DEBUG: raw_action value: {raw_action}")
-                        # if isinstance(raw_action, np.ndarray):
-                        #     print(f"DEBUG: raw_action shape: {raw_action.shape}")
+
 
                         if raw_action is None or np.array(raw_action).size == 0:
                             print("Warning: Received empty action from server!")
                             continue
-                        
+
                         inference_time = response_received_at - s
                         print(f'Network latency: {inference_time:.3f}s')
+                        keys = key_counter.get_press_events()
+                        if KeyCode(char='q') in keys:
+                            return
+                        if KeyCode(char='s') in keys:
+                            break
 
                         if raw_action is None:
                             print("No action from server, skipping...")
@@ -494,89 +438,21 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             # env.exec_actions subtracts robot_action_latency.
                             # Keep 50 ms for local delivery after that subtraction.
                             # curr_time below already includes elapsed inference time.
-                            action_exec_latency = max(
-                                float(rc.get('robot_action_latency', 0.0))
-                                for rc in robots_config) + 0.05
+                            action_exec_latency = action_delivery_margin(robots_config, grippers_config)
                             curr_time = time.time()
                             is_new = action_timestamps > (curr_time + action_exec_latency)
-                            prediction_steps = len(action_timestamps)
-                            kept_indices = np.flatnonzero(is_new)
-                            filtered_steps = prediction_steps - len(kept_indices)
-                            used_fallback = len(kept_indices) == 0
-                            
-                            # print(f"DEBUG: action_timestamps range: {action_timestamps[0]} to {action_timestamps[-1]}")
-                            # print(f"DEBUG: current_time: {curr_time}")
-                            # print(f"DEBUG: num_new_actions: {np.sum(is_new)}")
+                            valid_count = int(np.count_nonzero(is_new))
+                            this_target_poses = this_target_poses[is_new][:exec_horizon_steps]
+                            action_timestamps = action_timestamps[is_new][:exec_horizon_steps]
+                            print(f'[Timing] predicted={len(action)} eligible={valid_count} '
+                                  f'selected={len(action_timestamps)}', flush=True)
 
-                            if np.sum(is_new) == 0:
-                                selected_indices = np.array([prediction_steps - 1])
-                                this_target_poses = this_target_poses[[-1]]
-                                next_step_idx = int(np.ceil(
-                                    (curr_time + action_exec_latency - eval_t_start) / dt
-                                ))
-                                action_timestamp = eval_t_start + next_step_idx * dt
-                                print(f'Over budget: {action_timestamp - curr_time:.3f}s')
-                                action_timestamps = np.array([action_timestamp])
-                            else:
-                                selected_indices = kept_indices
-                                this_target_poses = this_target_poses[is_new]
-                                action_timestamps = action_timestamps[is_new]
-
-                            # 截取中间步骤，丢弃 horizon 末端低质量动作
-                            exec_start = 0   # 跳过前几步（可能已过时）
-                            exec_end = exec_horizon_steps
-                            this_target_poses = this_target_poses[exec_start:exec_end]
-                            action_timestamps = action_timestamps[exec_start:exec_end]
-                            selected_indices = selected_indices[exec_start:exec_end]
-                            remaining_steps = 1 if used_fallback else len(kept_indices)
-                            print(
-                                f"[Timing] step={iter_idx} predicted={prediction_steps} "
-                                f"filtered={filtered_steps} eligible={len(kept_indices)} "
-                                f"horizon_dropped={remaining_steps - len(selected_indices)} "
-                                f"selected_indices={selected_indices.tolist()} (0-based) "
-                                f"fallback={used_fallback}; "
-                                f"obs_age={curr_time - obs_timestamps[-1]:.3f}s "
-                                f"selection_margin={action_exec_latency:.3f}s dt={dt:.4f}s"
+                            env.exec_actions(
+                                actions=this_target_poses,
+                                timestamps=action_timestamps,
+                                compensate_latency=True
                             )
-                            if len(selected_indices):
-                                for i, rc in enumerate(robots_config):
-                                    lead = action_timestamps[0] - float(rc.get('robot_action_latency', 0)) - time.time()
-                                    target = this_target_poses[0, 7*i:7*i+6]
-                                    delta = np.linalg.norm(target[:3] - current_poses6[i, :3]) * 1000
-                                    print(f'[Timing] robot{i}: target distance={delta:.1f}mm compensated_lead={lead*1000:.1f}ms')
-                            if capture_prefix is not None:
-                                np.savez(capture_prefix + '_execution.npz',
-                                         decoded_actions=action, selected_actions=this_target_poses,
-                                         target_timestamps=action_timestamps, selected_indices=selected_indices,
-                                         debug_actions=np.asarray(debug_actions))
-
-                            if debug_actions:
-                                latest = env.get_obs()
-                                arms = []
-                                for i, rc in enumerate(robots_config):
-                                    measured = np.r_[latest[f'robot{i}_eef_pos'][-1], latest[f'robot{i}_eef_rot_axis_angle'][-1]]
-                                    targets = this_target_poses[:, 7*i:7*i+7]
-                                    arms.append(dict(robot_index=i, endpoint=[rc['robot_ip'], rc.get('robot_port', 4242)],
-                                                     measured_pose6=measured.tolist(),
-                                                     translation_delta_mm=(np.linalg.norm(targets[:, :3]-measured[:3], axis=1)*1000).tolist(),
-                                                     rotation_delta_deg=np.rad2deg((st.Rotation.from_rotvec(measured[3:6]).inv()*st.Rotation.from_rotvec(targets[:, 3:6])).magnitude()).tolist(),
-                                                     compensated_lead_ms=((action_timestamps-float(rc.get('robot_action_latency', 0))-time.time())*1000).tolist()))
-                                record = dict(step=iter_idx, wall_time=time.time(), arms=arms,
-                                              contract=options, configured_relative=action_is_relative,
-                                              input_state=current_state.tolist(), raw_actions=raw_action.tolist(),
-                                              inference_base_poses6=current_poses6.tolist(),
-                                              decoded_absolute_actions=action.tolist(), selected_targets=this_target_poses.tolist(),
-                                              action_timestamps=action_timestamps.tolist(), targets_submitted=False)
-                                with open(debug_path, 'a') as debug_file:
-                                    debug_file.write(json.dumps(record) + '\n')
-                                print(f'DEBUG step {iter_idx}: NO TARGETS SUBMITTED to either arm')
-                            else:
-                                env.exec_actions(
-                                    actions=this_target_poses,
-                                    timestamps=action_timestamps,
-                                    compensate_latency=True
-                                )
-                                print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions, grippers_m={this_target_poses[0, 6::7].tolist()}")
+                            print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions, grippers_m={this_target_poses[0, 6::7].tolist()}")
                             # print(f"Step {iter_idx}: Submitted {len(this_target_poses)} actions")
                         # 可视化
                         vis_img = obs[f'camera{vis_camera_idx}_rgb'][-1]

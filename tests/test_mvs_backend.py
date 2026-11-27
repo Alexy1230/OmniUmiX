@@ -12,8 +12,8 @@ import av
 import numpy as np
 import pytest
 
-from umi.real_world.mvs_capture import MvsCapture
-from umi.real_world.mvs_camera_config import normalize_mvs_configs, MvsImageTransform
+from umi.real_world.mvs_capture import MvsCapture, crop_with_black_padding
+from umi.real_world.mvs_camera_config import normalize_mvs_configs, MvsImageTransform, resize_image
 from umi.real_world.mvs_camera import MvsCamera, MultiMvsCamera
 
 
@@ -83,7 +83,9 @@ def fake_sdk(fail=None):
 
 
 def config(**overrides):
-    return normalize_mvs_configs([dict(serial='TEST', width=4, height=4, fps=30, **overrides)])[0]
+    return normalize_mvs_configs([
+        dict(serial='TEST', source_width=4, source_height=4, width=4, height=4, fps=30, **overrides)
+    ])[0]
 
 
 def test_sdk_selection_pixels_rotation_and_release():
@@ -133,6 +135,92 @@ def test_rgb_float_and_bgr_preview():
     np.testing.assert_allclose(rgb[0, 0], np.array([230, 20, 10])/255, atol=1e-7)
     preview = MvsImageTransform((2, 2), rgb=False)({'color': bgr})['color']
     np.testing.assert_array_equal(preview[0, 0], bgr[0, 0])
+
+
+def test_named_resize_interpolation_and_same_size_passthrough():
+    image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    transformed = MvsImageTransform((4, 4), interpolation='lanczos')({'color': image.copy()})['color']
+    np.testing.assert_array_equal(transformed, image[..., ::-1])
+    with pytest.raises(ValueError, match='resize_interpolation'):
+        normalize_mvs_configs([dict(serial='TEST', resize_interpolation='unknown')])
+
+
+def test_lanczos_resize_uses_ffmpeg_libswscale():
+    import av
+
+    image = np.arange(12 * 16 * 3, dtype=np.uint8).reshape(12, 16, 3)
+    expected = av.VideoFrame.from_ndarray(image, format='bgr24').reformat(
+        width=7,
+        height=5,
+        format='bgr24',
+        interpolation=av.video.reformatter.Interpolation.LANCZOS,
+    ).to_ndarray(format='bgr24')
+
+    actual = resize_image(image, (7, 5), 'lanczos')
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_center_square_crop_geometry():
+    source = np.arange(1080 * 1440, dtype=np.int32).reshape(1080, 1440)
+    cropped = crop_with_black_padding(source, {
+        'enabled': True, 'offset_x': 720, 'offset_y': 540, 'width': 1080, 'height': 1080,
+    })
+    np.testing.assert_array_equal(cropped, source[:, 180:1260])
+
+
+@pytest.mark.parametrize(
+    ('profile_name', 'crop_enabled'),
+    [
+        ('eval_pi05_adjust_tube_fov167.yaml', False),
+        ('eval_pi05_pick_and_place_red_cup_fov167.yaml', True),
+    ],
+)
+def test_fov167_profiles_match_training_contract(profile_name, crop_enabled):
+    import yaml
+
+    profile = Path(__file__).resolve().parents[1] / 'example' / profile_name
+    config = yaml.safe_load(profile.read_text())
+    camera = normalize_mvs_configs([config['mvs']['right_hand']])[0]
+    assert (camera['width'], camera['height']) == (240, 240)
+    assert (camera['source_width'], camera['source_height']) == (1440, 1080)
+    assert camera['resize_interpolation'] == 'lanczos'
+    assert camera['sensor_roi']['enabled'] is crop_enabled
+    if crop_enabled:
+        assert (camera['sensor_roi']['offset_x'], camera['sensor_roi']['offset_y']) == (720, 540)
+        assert (camera['sensor_roi']['width'], camera['sensor_roi']['height']) == (1080, 1080)
+    assert config['grippers'][0]['width_to_rad'] == {
+        'min_abs_width_m': 0.04385771672409207,
+        'max_abs_width_m': 0.14959563328076972,
+        'min_rad': 0.0,
+        'max_rad': 3.5,
+    }
+
+
+def test_all_center_crop_profiles_use_training_contract():
+    import yaml
+
+    profiles = sorted((Path(__file__).resolve().parents[1] / 'example').glob('*.yaml'))
+    checked = 0
+    for profile in profiles:
+        config = yaml.safe_load(profile.read_text())
+        if not isinstance(config, dict) or ('mvs' not in config and 'cameras' not in config):
+            continue
+        raw_cameras = (
+            list(config['mvs'].values())
+            if 'mvs' in config else list(config['cameras'])
+        )
+        for camera in normalize_mvs_configs(raw_cameras):
+            roi = camera.get('sensor_roi', {})
+            if not roi.get('enabled', False):
+                continue
+            checked += 1
+            assert (camera['source_width'], camera['source_height']) == (1440, 1080), profile
+            assert (camera['width'], camera['height']) == (240, 240), profile
+            assert camera['resize_interpolation'] == 'lanczos', profile
+            assert (roi['offset_x'], roi['offset_y']) == (720, 540), profile
+            assert (roi['width'], roi['height']) == (1080, 1080), profile
+    assert checked > 0
 
 
 @pytest.mark.parametrize('override', [{'fps': 0}, {'width': 3}, {'receive_latency': -1},
@@ -276,8 +364,10 @@ def test_sdk_roi_and_sensor_frame_rate():
     cfg = config(sensor_roi=dict(enabled=True, offset_x=180, offset_y=0, width=1080, height=1080), exposure_time=5000)
     cap = MvsCapture(cfg, sdk=sdk).open()
     cap.close()
-    assert ('MV_CC_SetIntValue', ('Width', 1080)) in calls
-    assert ('MV_CC_SetIntValue', ('OffsetX', 180)) in calls
+    # ROI is deliberately applied in software after mounting rotation.
+    assert ('MV_CC_SetIntValue', ('Width', 4)) in calls
+    assert ('MV_CC_SetIntValue', ('Height', 4)) in calls
+    assert ('MV_CC_SetIntValue', ('OffsetX', 0)) in calls
     assert ('MV_CC_SetFloatValue', ('AcquisitionFrameRate', 30.0)) in calls
     assert ('MV_CC_SetFloatValue', ('ExposureTime', 5000.0)) in calls
 
@@ -286,8 +376,8 @@ def test_example_profile_is_valid():
     import yaml
     profile = Path(__file__).resolve().parents[1] / 'example/eval_robots_config_mvs.yaml'
     cfg = yaml.safe_load(profile.read_text())
-    camera = normalize_mvs_configs(cfg['cameras'])[0]
-    assert camera['serial'] == 'DA9057798'
+    camera = normalize_mvs_configs([cfg['mvs']['right_hand']])[0]
+    assert camera['serial'] == 'DA9057815'
     assert camera['receive_latency'] == 0.0
     assert camera['fps'] == 30
 

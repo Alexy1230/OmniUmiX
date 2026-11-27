@@ -17,14 +17,17 @@
     "right_hand": {
         "backend": "mvs",
         "serial": "DA9057798",
-        "width": 480,
-        "height": 480,
+        "source_width": 1440,
+        "source_height": 1080,
+        "width": 240,
+        "height": 240,
+        "resize_interpolation": "lanczos",
         "fps": 30,
         "exposure_time": 12500,
         "sensor_roi": {
             "enabled": true,
             "offset_x": 720,
-            "offset_y": 720,
+            "offset_y": 540,
             "width": 1080,
             "height": 1080
         },

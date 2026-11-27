@@ -1,4 +1,4 @@
-""" 
+"""
 Sequential OpenPI PC client: execute a selected action prefix before inference.
 [Only support frankas and ur]
 
@@ -8,7 +8,6 @@ import sys
 import select
 import time
 import atexit
-import json
 import yaml
 import click
 import cv2
@@ -25,6 +24,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
 from umi.real_world.bimanual_umi_env import BimanualUmiEnv
+from umi.real_world.client_deployment import warmup_pi, wait_pending_actions
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
 from umi.real_world.keystroke_counter import KeystrokeCounter
 from umi.common.precise_sleep import precise_wait
@@ -33,6 +33,11 @@ from umi.real_world.bimanual_policy import (
     PolicyClient, policy_options, validate_hardware_config,
     configure_gripper_conversion, build_observation, decode_actions,
 )
+from umi.real_world.proprio_policy_client import ProprioPolicyClient, paired_history
+
+
+# The dedicated proprio entrypoint enables this before invoking the shared CLI.
+PROPRIOCEPTION = False
 
 
 def apply_gripper_close_offset(actions, offset_m, width_limits):
@@ -65,6 +70,19 @@ def select_action_horizon(actions, horizon_steps):
             or horizon_steps <= 0):
         raise ValueError('Execution horizon must be a positive integer')
     return actions[:min(horizon_steps, len(actions))].copy()
+
+
+def set_proprio_request_history(client, obs, resolution, scales, options, count):
+    """Attach the aligned previous/current history required by proprio servers."""
+    previous_images, history = paired_history(
+        obs, resolution, scales, options, count=count
+    )
+    timestamps = np.asarray(obs['timestamp'], dtype=float)
+    if timestamps.shape != (2,):
+        raise ValueError('Proprio requires exactly two observation timestamps')
+    client.set_history(
+        previous_images, history, float(timestamps[0]), float(timestamps[-1])
+    )
 
 
 def solve_table_collision(ee_pose, gripper_width, height_threshold):
@@ -128,18 +146,6 @@ def read_episode_keys(key_counter):
 
 
 def finish_episode_recording(env):
-    """Avoid the environment's timestamps[-1] on a trial with no actions."""
-    if env.obs_accumulator is None:
-        return
-    actions = env.action_accumulator
-    obs_times = env.obs_accumulator.timestamps
-    if (actions is None or len(actions.timestamps) == 0
-            or not obs_times or any(len(t) == 0 for t in obs_times.values())):
-        env.camera.stop_recording()
-        env.obs_accumulator = None
-        env.action_accumulator = None
-        print('[Episode] No complete observation/action samples; replay entry skipped.', flush=True)
-        return
     env.end_episode()
 
 
@@ -157,21 +163,8 @@ def episode_stop_reason(key_counter, started_at, max_duration, step, max_timeste
     return None
 
 
-def wait_pending_actions(env, last_action_end_time, timeout=20.0):
-    """Let submitted actions finish; never clear a worker-owned queue."""
-    deadline = time.monotonic() + max(timeout, last_action_end_time - time.time() + 5.0)
-    while True:
-        if any(not robot.is_alive() for robot in env.robots):
-            raise RuntimeError('Robot worker stopped')
-        if all(robot.input_queue.empty() for robot in env.robots) and time.time() >= last_action_end_time:
-            return
-        if time.monotonic() > deadline:
-            raise TimeoutError('Previous robot actions did not drain; not starting another trial')
-        time.sleep(0.02)
-
-
 def execute_action_chunk(env, actions, dt, key_counter, started_at,
-                         max_duration, step, max_timesteps, debug_actions=False):
+                         max_duration, step, max_timesteps):
     """Play every row in order, one control period each, without latency offsets.
 
     Like the old OpenPI execute() loop, completion means the command period has
@@ -190,10 +183,12 @@ def execute_action_chunk(env, actions, dt, key_counter, started_at,
             # The future endpoint gives the existing interpolator one period.
             target_time = time.time() + dt
             timestamps.append(target_time)
-            if not debug_actions:
-                env.exec_actions(actions=action[None],
-                                 timestamps=np.array([target_time]),
-                                 compensate_latency=False)
+            submitted = env.exec_actions(
+                actions=action[None], timestamps=np.array([target_time]), compensate_latency=False
+            )
+            if not len(submitted):
+                timestamps.pop()
+                raise TimeoutError('Sequential waypoint deadline missed')
             step += 1
             while time.time() < target_time:
                 if reason is None:
@@ -204,7 +199,7 @@ def execute_action_chunk(env, actions, dt, key_counter, started_at,
                 break
     finally:
         # Also drain a partially submitted row if execution/keyboard handling fails.
-        if timestamps and not debug_actions:
+        if timestamps:
             wait_pending_actions(env, timestamps[-1])
     return step, reason, np.asarray(timestamps, dtype=np.float64)
 
@@ -262,11 +257,9 @@ def restore_initial_gripper_opening(env, grippers_config):
 @click.option('--robot-config', '-rc', required=True, help='Path to robot_config yaml file')
 @click.option('--camera-reorder', '-cr', default=None, help='Optional comma-separated camera indices')
 @click.option('--vis-camera-idx', default=0, type=int, help='Which camera to visualize')
-@click.option('--save-policy-data', is_flag=True, help='Save exact request image/state and returned actions; does not disable motion.')
-@click.option('--debug-actions', is_flag=True, help='Inspect and log predictions; do not submit policy actions or request homing/initial gripper movement. Controllers still start.')
 @click.option('--init-joints', '-j', is_flag=True, default=False, help='Initialize joints once at startup; automatic when YAML joints_init is present')
 @click.option('--max-duration', '-md', default=2000000, type=float, help='Max duration per episode (seconds)')
-@click.option('--max-timesteps', '-mt', default=500, type=int, help='Max action rows per episode (including virtual rows in debug mode)')
+@click.option('--max-timesteps', '-mt', default=500, type=int, help='Max action rows per episode')
 @click.option('--frequency', '-f', default=None, type=float, help='Control frequency; defaults to policy.control_fps')
 @click.option('--obs-image-resolution', default=None, type=int, help='Image size; defaults to policy.image_resolution')
 @click.option('--exec-horizon-steps', default=None, type=int,
@@ -279,19 +272,28 @@ def main(server_url, prompt, request_timeout, output, robot_config,
          camera_reorder, vis_camera_idx, init_joints,
          max_duration, max_timesteps,
          frequency, obs_image_resolution, exec_horizon_steps, no_mirror, mirror_swap,
-         gripper_close_offset_mm, debug_actions, save_policy_data):
+         gripper_close_offset_mm):
 
-    if debug_actions:
-        init_joints = False
-        print("DEBUG: no policy targets, homing, or initial gripper move. Environment still enables holding controllers and resets gripper zero.")
 
     # Load robot config
     robot_config_data = yaml.safe_load(open(os.path.expanduser(robot_config), 'r'))
-    policy_config = robot_config_data.get('policy', {})
+    policy_config = dict(robot_config_data.get('policy', {}))
+    history_gap = None
+    if PROPRIOCEPTION:
+        history_gap = float(policy_config.get('proprio_history_seconds', 0.1))
+        if policy_config.get('action_is_relative', False) is not False:
+            raise click.UsageError(
+                'Proprio server returns absolute actions: set action_is_relative: false'
+            )
+        policy_config['action_is_relative'] = False
+        if not np.isfinite(history_gap) or not 0 < history_gap <= 1.0:
+            raise click.UsageError(
+                'proprio_history_seconds must be within (0, 1] and match training'
+            )
     server_url = server_url or policy_config.get('server_url')
     prompt = prompt if prompt is not None else policy_config.get('prompt', '')
     request_timeout = request_timeout or float(policy_config.get('request_timeout_s', 30.0))
-    frequency = frequency or float(policy_config.get('control_fps', 30.0))
+    frequency = float(policy_config.get('control_fps', 30.0)) if frequency is None else frequency
     obs_image_resolution = obs_image_resolution or int(policy_config.get('image_resolution', 240))
     if exec_horizon_steps is None:
         exec_horizon_steps = int(policy_config.get('exec_horizon_steps', 32))
@@ -317,9 +319,9 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     if not np.isfinite(gripper_close_offset_mm) or gripper_close_offset_mm < 0:
         raise click.UsageError('--gripper-close-offset-mm must be finite and non-negative')
     gripper_close_offset_m = gripper_close_offset_mm / 1000.0
-    
+
     dt = 1 / frequency
-    down_sample_steps = 1
+    down_sample_steps = history_gap * frequency if PROPRIOCEPTION else 1
     for i, (rc, gc) in enumerate(zip(robots_config, grippers_config)):
         if rc.get('joints_init') is not None:
             joints = np.asarray(rc['joints_init'], dtype=float)
@@ -330,7 +332,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
             width = float(gc['initial_position'])
             if not np.isfinite(width) or not 0 <= width <= 0.20:
                 raise click.UsageError(f'gripper{i}: initial_position must be metres within [0, 0.20]')
-    
+
     if camera_reorder is None:
         camera_indices = None if cameras_config is not None else list(range(num_robots))
     else:
@@ -342,7 +344,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     print(f'Model contract: {options}')
 
     print("=" * 60)
-    print("UMI Policy Client)")
+    variant = 'Proprio Sequential' if PROPRIOCEPTION else 'Sequential'
+    print(f"UMI Policy Client ({variant})")
     print("=" * 60)
     print(f"Server URL: {server_url}")
     print(f"Number of robots: {num_robots}")
@@ -351,47 +354,24 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     print(f"Control frequency: {frequency} Hz")
     print(f"Execution horizon: {exec_horizon_steps} action rows per inference")
     print(f"Gripper close offset: {gripper_close_offset_mm:g} mm")
+    if PROPRIOCEPTION:
+        print(f"Proprio history spacing: {history_gap:g} s")
     print("Action latency compensation: disabled")
     print("=" * 60)
 
     print('[Startup] Connecting to policy server...', flush=True)
-    policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout,
-                                 num_robots=num_robots, policy_config=policy_config)
+    client_class = ProprioPolicyClient if PROPRIOCEPTION else PolicyClient
+    policy_client = client_class(
+        server_url, prompt=prompt, timeout=request_timeout,
+        num_robots=num_robots, policy_config=policy_config)
     atexit.register(policy_client.close)
-    capture_dir = None
-    capture_idx = 0
-    if save_policy_data:
-        import tempfile
-        capture_root = os.path.join(os.path.expanduser(output), 'policy_io')
-        os.makedirs(capture_root, exist_ok=True)
-        capture_dir = tempfile.mkdtemp(prefix='run_', dir=capture_root)
-        print(f"Policy request/response files: {capture_dir}")
-        with open(os.path.join(capture_dir, 'metadata.json'), 'w') as capture_file:
-            json.dump(dict(
-                robot_config=robot_config_data, server_metadata=policy_client.metadata,
-                server_url=server_url, prompt=prompt, action_is_relative=action_is_relative,
-                frequency=frequency, exec_horizon_steps=exec_horizon_steps,
-                execution_mode="sequential_horizon",
-                compensate_latency=False, debug_actions=debug_actions,
-                gripper_close_offset_mm=gripper_close_offset_mm,
-                image_resolution=obs_image_resolution,
-                hardware_to_model_gripper_scale=hardware_to_model_gripper_scale.tolist(),
-                model_to_hardware_gripper_scale=model_to_hardware_gripper_scale.tolist(),
-                hardware_to_model_gripper_offset=options['hardware_to_model_gripper_offset'],
-                model_to_hardware_gripper_offset=options['model_to_hardware_gripper_offset'],
-            ), capture_file, indent=2, default=str)
-    debug_path = os.path.join(os.path.expanduser(output), 'action_debug.jsonl')
-    if debug_actions:
-        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
-        print(f"Action diagnostics: {debug_path}")
-        print(f"Server metadata: {policy_client.metadata}")
-        print(f"Configured relative actions: {action_is_relative}; TCP transform: {[rc.get('tx_flange_tcp') for rc in robots_config]}")
 
     print('[Startup] Starting keyboard listener and hardware environment...', flush=True)
     with SharedMemoryManager() as shm_manager:
         with KeystrokeCounter() as key_counter, \
             BimanualUmiEnv(
                 output_dir=output,
+                video_only=True,
                 robots_config=robots_config,
                 grippers_config=grippers_config,
                 frequency=frequency,
@@ -399,13 +379,14 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 obs_float32=False,
                 camera_reorder=camera_indices,
                 cameras_config=cameras_config,
-                init_joints=(not debug_actions and (
-                    init_joints or any(rc.get('joints_init') is not None for rc in robots_config))),
+                init_joints=(init_joints or any(rc.get('joints_init') is not None for rc in robots_config)),
                 enable_multi_cam_vis=True,
                 # latency
                 camera_obs_latency=0.17,
                 # downsample
-                camera_down_sample_steps=down_sample_steps,
+                camera_down_sample_steps=(
+                    [down_sample_steps, 0] if PROPRIOCEPTION else down_sample_steps
+                ),
                 robot_down_sample_steps=down_sample_steps,
                 gripper_down_sample_steps=down_sample_steps,
                 # obs horizon (默认值，可以根据模型调整)
@@ -430,9 +411,14 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                                                 else robot.get_state()['ActualQ'], dtype=float).copy())
                 home_duration.append(float(rc.get('joints_init_duration', 5.0)))
                 print(f'robot{i} initial joints for R: {initial_joints[-1]}')
-            if not debug_actions:
-                restore_initial_gripper_opening(env, grippers_config)
-                
+            restore_initial_gripper_opening(env, grippers_config)
+
+            if not warmup_pi(
+                env, policy_client, obs_image_resolution, hardware_to_model_gripper_scale, options,
+                lambda: read_episode_keys(key_counter),
+            ):
+                return
+
             print('C starts; S ends; R returns to initial joints and restores gripper opening while idle; Q quits.')
             print('After an episode, submitted actions finish and the arm holds. Homing requires R.')
 
@@ -441,11 +427,6 @@ def main(server_url, prompt, request_timeout, output, robot_config,
             print("=" * 60)
 
             episode_idx = 0
-            # Replay entries may be absent for a stopped/no-action trial. Keep
-            # videos separate even when replay_buffer.n_episodes does not grow.
-            import tempfile
-            trial_video_root = env.video_dir / os.path.basename(
-                tempfile.mkdtemp(prefix='trials_', dir=str(env.video_dir)))
 
             while True:
                 print("\nWaiting for start command...")
@@ -467,11 +448,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                         print("Exiting...")
                         return
                     if 'r' in press_events:
-                        if not debug_actions:
-                            return_to_initial_joints(env, shm_manager, initial_joints, home_duration)
-                            restore_initial_gripper_opening(env, grippers_config)
-                        else:
-                            print('Debug: skipping joint return and gripper opening.', flush=True)
+                        return_to_initial_joints(env, shm_manager, initial_joints, home_duration)
+                        restore_initial_gripper_opening(env, grippers_config)
                         # Homing never starts inference; require a fresh C afterwards.
                         if 'q' in read_episode_keys(key_counter):
                             return
@@ -486,8 +464,6 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 last_action_end_time = 0.0
                 try:
                     episode_idx += 1
-                    env.video_dir = trial_video_root / f'trial_{episode_idx:06d}'
-                    env.video_dir.mkdir(parents=True, exist_ok=True)
                     print(f'Episode {episode_idx}')
                     print("\n" + "=" * 60)
                     print("Policy control started!")
@@ -499,16 +475,11 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                     t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
 
+                    if PROPRIOCEPTION:
+                        policy_client.reset_episode()
+
                     # get initial obs
                     obs = env.get_obs()
-                    episode_start_pose = []
-                    for robot_id in range(num_robots):
-                        pose = np.concatenate([
-                            obs[f'robot{robot_id}_eef_pos'],
-                            obs[f'robot{robot_id}_eef_rot_axis_angle']
-                        ], axis=-1)[-1]
-                        episode_start_pose.append(pose)
-
                     precise_wait(eval_t_start, time_func=time.time)
                     print("Started!")
 
@@ -530,32 +501,17 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             obs, num_robots, obs_image_resolution,
                             hardware_to_model_gripper_scale, options)
 
-                        capture_prefix = None
-                        if capture_dir is not None:
-                            capture_prefix = os.path.join(capture_dir, f'{capture_idx:06d}')
-                            capture_idx += 1
-                            np.savez(capture_prefix + '_input.npz',
-                                     images_rgb=np.stack(images), state=current_state,
-                                     measured_poses6=current_poses6, gripper_widths_m=current_widths,
-                                     observation_timestamps=np.asarray(obs_timestamps),
-                                     prompt=np.asarray(prompt), step=np.asarray(iter_idx), episode=np.asarray(episode_idx))
-                            for i, image in enumerate(images):
-                                if not cv2.imwrite(capture_prefix + f'_camera{i}.png', image[..., ::-1]):
-                                    raise IOError('Could not save policy input image')
+                        if PROPRIOCEPTION:
+                            set_proprio_request_history(
+                                policy_client, obs, obs_image_resolution,
+                                hardware_to_model_gripper_scale, options, num_robots)
+
 
                         # Server-client communication
                         s = time.time()
                         raw_action = policy_client.call_server(images, current_state)
                         response_received_at = time.time()
-                        if capture_prefix is not None:
-                            np.savez(
-                                capture_prefix + '_response.npz',
-                                actions=np.asarray(raw_action) if raw_action is not None else np.empty((0, 10 * num_robots), dtype=np.float32),
-                                response_valid=np.asarray(raw_action is not None),
-                                request_started_at=np.asarray(s),
-                                response_received_at=np.asarray(response_received_at),
-                            )
-                        
+
                         reason = episode_stop_reason(
                             key_counter, eval_t_start, max_duration, iter_idx, max_timesteps)
                         if reason:
@@ -591,46 +547,27 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                                     ee_poses=target_pose.reshape([num_robots, -1]),
                                     robots_config=robots_config)
 
-                        chunk_start_step = iter_idx
+                        for arm in range(num_robots):
+                            widths = this_target_poses[:, arm * 7 + 6] * 1000
+                            measured = env.grippers[arm].get_current_gripper_width() * 1000
+                            print(
+                                f"[Gripper {arm}] measured={measured:.2f}mm "
+                                f"first6={widths[:6].round(2).tolist()} "
+                                f"last={widths[-1]:.2f}mm "
+                                f"range=[{widths.min():.2f}, {widths.max():.2f}]mm",
+                                flush=True,
+                            )
+
                         iter_idx, reason, action_timestamps = execute_action_chunk(
                             env, this_target_poses, dt, key_counter, eval_t_start,
-                            max_duration, iter_idx, max_timesteps, debug_actions)
+                            max_duration, iter_idx, max_timesteps)
                         played_steps = len(action_timestamps)
-                        selected_indices = np.arange(played_steps)
-                        selected_targets = this_target_poses[:played_steps]
-                        if played_steps and not debug_actions:
+                        if played_steps:
                             last_action_end_time = float(action_timestamps[-1])
                         print(f'[Sequential] predicted={predicted_steps} '
                               f'selected={len(this_target_poses)} played={played_steps} '
                               f'dt={dt:.4f}s; latency_compensation=False; '
-                              f'debug={debug_actions}; stop={reason}')
-                        if capture_prefix is not None:
-                            np.savez(capture_prefix + '_execution.npz',
-                                     decoded_actions=tuned_actions, selected_actions=selected_targets,
-                                     target_timestamps=action_timestamps, selected_indices=selected_indices,
-                                     debug_actions=np.asarray(debug_actions),
-                                     stop_reason=np.asarray(reason or ''))
-                        if debug_actions:
-                            arms = []
-                            for i, rc in enumerate(robots_config):
-                                measured = current_poses6[i]
-                                targets = selected_targets[:, 7*i:7*i+7]
-                                arms.append(dict(robot_index=i,
-                                                 endpoint=[rc['robot_ip'], rc.get('robot_port', 4242)],
-                                                 measured_pose6=measured.tolist(),
-                                                 translation_delta_mm=(np.linalg.norm(targets[:, :3]-measured[:3], axis=1)*1000).tolist(),
-                                                 rotation_delta_deg=(np.rad2deg((st.Rotation.from_rotvec(measured[3:6]).inv()*st.Rotation.from_rotvec(targets[:, 3:6])).magnitude()).tolist() if played_steps else [])))
-                            record = dict(episode=episode_idx, step=chunk_start_step, arms=arms,
-                                          wall_time=time.time(), execution_mode='sequential_horizon',
-                                          exec_horizon_steps=exec_horizon_steps,
-                                          contract=options, configured_relative=action_is_relative,
-                                          input_state=current_state.tolist(), raw_actions=raw_action.tolist(),
-                                          inference_base_poses6=current_poses6.tolist(),
-                                          decoded_absolute_actions=tuned_actions.tolist(),
-                                          selected_targets=selected_targets.tolist(),
-                                          action_timestamps=action_timestamps.tolist(), targets_submitted=False)
-                            with open(debug_path, 'a') as debug_file:
-                                debug_file.write(json.dumps(record) + '\n')
+                              f'stop={reason}')
                         if reason:
                             print(f'Episode stopped during chunk: {reason}')
                             quit_requested = reason == 'quit'
@@ -651,9 +588,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                     quit_requested = True
                 finally:
                     try:
-                        if not debug_actions:
-                            print('[Episode] Waiting for submitted robot actions to finish...', flush=True)
-                            wait_pending_actions(env, last_action_end_time)
+                        print('[Episode] Waiting for submitted arm and gripper actions to finish...', flush=True)
+                        wait_pending_actions(env, last_action_end_time)
                     finally:
                         print('[Episode] Finalizing recording...', flush=True)
                         finish_episode_recording(env)

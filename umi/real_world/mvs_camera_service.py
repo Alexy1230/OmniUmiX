@@ -315,7 +315,14 @@ def main():
     with SharedMemoryManager() as manager:
         camera = MultiMvsCamera(
             configs, shm_manager=manager, get_max_k=options['get_max_k'],
-            transform=[MvsImageTransform(tuple(options['obs_resolution']), float32=options['obs_float32']) for _ in configs],
+            transform=[
+                MvsImageTransform(
+                    tuple(options['obs_resolution']),
+                    float32=options['obs_float32'],
+                    interpolation=config['resize_interpolation'],
+                )
+                for config in configs
+            ],
             vis_transform=[MvsImageTransform(tuple(options['vis_resolution']), rgb=False) for _ in configs],
         )
         try:

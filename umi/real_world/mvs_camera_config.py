@@ -2,8 +2,62 @@
 from dataclasses import dataclass
 import math
 
+import av
 import cv2
 import numpy as np
+
+
+_RESIZE_INTERPOLATIONS = {
+    'nearest': cv2.INTER_NEAREST,
+    'linear': cv2.INTER_LINEAR,
+    'area': cv2.INTER_AREA,
+    'cubic': cv2.INTER_CUBIC,
+    'lanczos': cv2.INTER_LANCZOS4,
+}
+
+
+def resize_interpolation(value):
+    """Validate a named resize method and return its OpenCV equivalent."""
+    name = str(value).lower()
+    if name not in _RESIZE_INTERPOLATIONS:
+        raise ValueError(
+            'resize_interpolation must be one of: '
+            + ', '.join(sorted(_RESIZE_INTERPOLATIONS))
+        )
+    return _RESIZE_INTERPOLATIONS[name]
+
+
+def resize_image(image, resolution, interpolation='linear'):
+    """Resize a BGR uint8 camera frame with the selected implementation.
+
+    The training video pipeline uses FFmpeg ``scale=...:flags=lanczos``.  PyAV's
+    LANCZOS reformatter calls the same libswscale implementation; OpenCV's
+    INTER_LANCZOS4 is a different filter and noticeably amplifies high-frequency
+    image noise.
+    """
+    resolution = tuple(resolution)
+    if image.shape[1::-1] == resolution:
+        return image
+
+    name = str(interpolation).lower()
+    resize_interpolation(name)
+    if name == 'lanczos':
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError('libswscale Lanczos expects a uint8 HWC BGR image')
+        frame = av.VideoFrame.from_ndarray(
+            np.ascontiguousarray(image), format='bgr24')
+        return frame.reformat(
+            width=resolution[0],
+            height=resolution[1],
+            format='bgr24',
+            interpolation=av.video.reformatter.Interpolation.LANCZOS,
+        ).to_ndarray(format='bgr24')
+
+    return cv2.resize(
+        image,
+        resolution,
+        interpolation=resize_interpolation(name),
+    )
 
 
 def normalize_mvs_configs(configs, camera_reorder=None):
@@ -15,27 +69,42 @@ def normalize_mvs_configs(configs, camera_reorder=None):
         if not isinstance(cfg.get('serial'), str) or not cfg['serial'].strip():
             raise ValueError('Each MVS camera requires an exact serial string')
         
-        for key, default in [('width', 480), ('height', 480), ('fps', 30),
+        for key, default in [('source_width', 1440), ('source_height', 1080),
+                             ('width', 480), ('height', 480), ('fps', 30),
                              ('frame_timeout_ms', 1000)]:
             value = cfg.get(key, default)
-            # if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 or int(value) != value:
-            #     raise ValueError(f'{key} must be a positive integer')
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0 or int(value) != value):
+                raise ValueError(f'{key} must be a positive integer')
             cfg[key] = int(value)
+
+        cfg['resize_interpolation'] = str(
+            cfg.get('resize_interpolation', 'linear')
+        ).lower()
+        resize_interpolation(cfg['resize_interpolation'])
 
         if cfg['width'] % 2 or cfg['height'] % 2:
             raise ValueError('MVS output dimensions must be even for yuv420p video recording')
         
         latency = float(cfg.get('receive_latency', 0.0))
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError('receive_latency must be finite and non-negative')
         cfg['receive_latency'] = latency
         timeout = float(cfg.get('launch_timeout', 15))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('launch_timeout must be finite and positive')
         cfg['launch_timeout'] = timeout
         roi = cfg.get('sensor_roi', {})
         if roi.get('enabled', False):
-            for key in ['width', 'height', 'offset_x', 'offset_y']:
-                value = roi.get(key, 0)
-                # minimum = 1 if key in ['width', 'height'] else 0
-                # if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-                #     raise ValueError(f'sensor_roi.{key} must be an integer >= {minimum}')
+            for key in ('width', 'height'):
+                value = roi.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f'sensor_roi.{key} must be a positive integer')
+            for key in ('offset_x', 'offset_y'):
+                value = roi.get(key)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value)):
+                    raise ValueError(f'sensor_roi.{key} must be finite')
         result.append(cfg)
 
     if len({cfg['serial'] for cfg in result}) != len(result):
@@ -54,11 +123,15 @@ class MvsImageTransform:
     resolution: tuple
     rgb: bool = True
     float32: bool = False
+    interpolation: str = 'linear'
 
     def __call__(self, data):
         # Driver already applies software ROI/padding and mounting rotation. Use the
         # square OmniUmiX image, without official GoPro/mirror/gripper masks.
-        image = cv2.resize(data['color'], tuple(self.resolution), interpolation=cv2.INTER_LINEAR)
+        image = data['color']
+        if image.shape[1::-1] != tuple(self.resolution):
+            image = resize_image(
+                image, tuple(self.resolution), self.interpolation)
         if self.rgb:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         if self.float32:

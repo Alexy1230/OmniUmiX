@@ -46,6 +46,7 @@ os.environ["OMP_NUM_THREADS"] = "4"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
+from umi.real_world.client_deployment import warmup_requests
 from umi.real_world.bimanual_umi_env import BimanualUmiEnv
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
 from umi.common.precise_sleep import precise_wait
@@ -200,6 +201,27 @@ class PolicyClient:
 
 # ============ 主函数 ============
 
+def build_zero_action_observation(obs, obs_image_resolution, hardware_to_model_gripper_scale):
+    image = cv2.resize(
+        obs['camera0_rgb'][-1],
+        (obs_image_resolution, obs_image_resolution),
+        interpolation=cv2.INTER_AREA,
+    ).astype(np.uint8, copy=False)
+    current_pose6 = np.concatenate([
+        obs['robot0_eef_pos'][-1],
+        obs['robot0_eef_rot_axis_angle'][-1],
+    ])
+    current_pose9 = pose_6d_to_pose_9d(current_pose6)
+    current_gripper = np.asarray(
+        obs['robot0_gripper_width'][-1], dtype=np.float32
+    ).reshape(-1)[:1] * hardware_to_model_gripper_scale
+    current_state = np.concatenate(
+        [current_pose9, current_gripper]
+    ).astype(np.float32)
+
+    return image, current_state, current_pose6
+
+
 @click.command()
 @click.option('--server-url', '-s', default=None, help='OpenPI WebSocket URL; defaults to policy.server_url in robot config')
 @click.option('--prompt', default=None, help='Task prompt; defaults to policy.prompt in robot config')
@@ -281,6 +303,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
         with KeystrokeCounter() as key_counter, \
             BimanualUmiEnv(
                 output_dir=output,
+                video_only=True,
                 robots_config=robots_config,
                 grippers_config=grippers_config,
                 frequency=frequency,
@@ -318,6 +341,16 @@ def main(server_url, prompt, request_timeout, output, robot_config,
             if 'initial_position' in grippers_config[0]:
                 print("Zero-action mode: configured initial gripper movement skipped.")
 
+
+            def warmup_infer(obs):
+                image, state, _ = build_zero_action_observation(
+                    obs, obs_image_resolution, hardware_to_model_gripper_scale)
+                policy_client.call_server(image, state)
+
+            if not warmup_requests(
+                    env, warmup_infer,
+                    lambda: {key.char for key in key_counter.get_press_events() if isinstance(key, KeyCode)}):
+                return
 
             print("\n" + "=" * 60)
             print("Ready! Press 'C' to start policy, 'Q' to quit")
@@ -397,36 +430,19 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                         obs_timestamps = obs['timestamp']
                         print(f'Obs latency: {time.time() - obs_timestamps[-1]:.3f}s')
 
-                        image = cv2.resize(
-                            obs['camera0_rgb'][-1],
-                            (obs_image_resolution, obs_image_resolution),
-                            interpolation=cv2.INTER_AREA,
-                        ).astype(np.uint8, copy=False)
-                        current_pose6 = np.concatenate([
-                            obs['robot0_eef_pos'][-1],
-                            obs['robot0_eef_rot_axis_angle'][-1],
-                        ])
-                        current_pose9 = pose_6d_to_pose_9d(current_pose6)
-                        current_gripper = np.asarray(
-                            obs['robot0_gripper_width'][-1], dtype=np.float32
-                        ).reshape(-1)[:1] * hardware_to_model_gripper_scale
-                        current_state = np.concatenate(
-                            [current_pose9, current_gripper]
-                        ).astype(np.float32)
+                        image, current_state, current_pose6 = build_zero_action_observation(
+                            obs, obs_image_resolution, hardware_to_model_gripper_scale)
 
                         # 调用服务器获取动作
                         s = time.time()
                         raw_action = policy_client.call_server(image, current_state)
-                        
-                        # print(f"DEBUG: raw_action type: {type(raw_action)}")
-                        # print(f"DEBUG: raw_action value: {raw_action}")
-                        # if isinstance(raw_action, np.ndarray):
+
                         #     print(f"DEBUG: raw_action shape: {raw_action.shape}")
 
                         if raw_action is None or np.array(raw_action).size == 0:
                             print("Warning: Received empty action from server!")
                             continue
-                        
+
                         inference_time = time.time() - s
                         print(f'Network latency: {inference_time:.3f}s')
 
@@ -506,10 +522,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             action_exec_latency = 0.01
                             curr_time = time.time()
                             is_new = action_timestamps > (curr_time + action_exec_latency)
-                            
-                            # print(f"DEBUG: action_timestamps range: {action_timestamps[0]} to {action_timestamps[-1]}")
-                            # print(f"DEBUG: current_time: {curr_time}")
-                            # print(f"DEBUG: num_new_actions: {np.sum(is_new)}")
+
 
                             if np.sum(is_new) == 0:
                                 this_target_poses = this_target_poses[[-1]]

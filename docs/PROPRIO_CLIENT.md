@@ -31,11 +31,10 @@ action_is_relative: false
 ```bash
 python policy_client_pi_proprio_episodes.py \
   --robot-config example/YOUR_CONFIG.yaml \
-  --output data_local/policy_trial \
-  --save-policy-data --debug-actions
+  --output data_local/policy_trial
 ```
 
-检查后去掉 `--debug-actions` 执行。调试模式仍启动控制器并保留原夹爪置零行为。C 开始，S 结束，R 回初始关节，Q 退出。执行频率、轨迹筛选及碰撞处理沿用原 episode 客户端。
+启动后使用实测图像和历史做两次 warmup，预测结果直接丢弃。C 开始录像和执行，S 结束本轮，R 回初始关节，Q 退出。录像保存到输出目录的 `videos/episode_*/`。
 
 ## Proprio 模型服务要求（不能混用 checkpoint）
 
@@ -52,7 +51,7 @@ python policy_client_pi_proprio_episodes.py \
 
 使用环境时间轴请求 `[t-gap,t]`，而不是上一次推理。相机取最近真实帧，TCP/夹爪插值到目标时间；实际同步仍依赖传感器延迟配置和采样质量。
 
-每轮第一个模型请求捕获固定起始位姿。历史早于该时刻时，同时填充各臂首帧图像和状态。C 开始下一轮时重新初始化。`--save-policy-data` 额外保存完整 `*_proprio_input.npz`。
+每轮第一个模型请求捕获固定起始位姿。历史早于该时刻时，同时填充各臂首帧图像和状态。C 开始下一轮时重新初始化。
 
 ## 文件及验证
 

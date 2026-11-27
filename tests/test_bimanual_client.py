@@ -146,7 +146,7 @@ def test_temporal_average_handles_both_rotations_and_valid_zeros():
 def load_env():
     tree = ast.parse((ROOT / 'umi/real_world/bimanual_umi_env.py').read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'BimanualUmiEnv')
-    namespace = dict(np=np, time=time, math=math, pathlib=__import__('pathlib'), List=list,
+    namespace = dict(np=np, time=time, math=math, pathlib=__import__('pathlib'), tempfile=__import__('tempfile'), List=list,
                      validate_hardware_config=validate_hardware_config)
     exec(compile(ast.Module(body=[cls], type_ignores=[]), 'bimanual_umi_env.py', 'exec'), namespace)
     return namespace['BimanualUmiEnv'], namespace
@@ -180,6 +180,8 @@ class FakeGripper:
         return self.get_all_state()['gripper_position'][-1]
     def move_gripper(self, width_m, **kwargs):
         self.calls.append(dict(width_m=width_m, **kwargs))
+    def schedule_waypoints(self, **kwargs):
+        self.calls.append(kwargs)
 
 
 @pytest.mark.parametrize('same_nuc', [False, True])
@@ -234,7 +236,10 @@ def test_env_routes_both_pose_slices_and_grippers_with_shared_timeline():
         np.testing.assert_array_equal(calls[0]['pose'], actions[1, i*7:i*7+6])
         assert calls[0]['target_time'] == 101. - env.robots_config[i]['robot_action_latency']
         assert len(env.grippers[i].calls) == 1
-        assert env.grippers[i].calls[0]['width_m'] == actions[1, i*7+6]
+        gripper = env.grippers[i].calls[0]
+        np.testing.assert_array_equal(gripper['widths_m'], actions[1:, i*7+6])
+        np.testing.assert_allclose(gripper['target_times'],
+                                   np.array([101., 102.]) - env.grippers_config[i].get('gripper_action_latency', 0.))
 
 
 
@@ -320,18 +325,18 @@ def test_observation_assembly_uses_both_camera_and_robot_indices(monkeypatch):
 
 
 @pytest.mark.parametrize('count', [1, 2])
-@pytest.mark.parametrize('debug', [False, True])
 @pytest.mark.parametrize('entry', ['policy_client_pi.py', 'policy_client_pi_episodes.py'])
 @pytest.mark.parametrize('calibrated', [False, True])
-def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkeypatch, debug, entry, count, calibrated):
-    """Exercise request, decode, selection, saving and episode teardown together."""
+def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkeypatch, entry, count, calibrated):
+    """Exercise warmup, request, decode, selection and episode teardown together."""
     import atexit
     import click
     import contextlib
-    import json
+    from collections import deque
     import os
     import yaml
-    from umi.real_world import bimanual_policy as bp
+    from umi.real_world import bimanual_policy as bp, client_deployment as deploy
+    from umi.real_world import mvs_camera_config
     robots, grippers = configs()
     robots, grippers = robots[:count], grippers[:count]
     if calibrated:
@@ -351,6 +356,8 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
     submissions, requests = [], []
     class Env:
         def __init__(self, **kwargs):
+            assert kwargs['video_only']
+            self.grippers = self.grippers_config = []
             self.video_dir = tmp_path/'videos'
             self.video_dir.mkdir()
             self.robots = [types.SimpleNamespace(get_state=lambda: {'ActualQ': np.zeros(7)}) for _ in range(count)]
@@ -370,8 +377,9 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
             pass
         def end_episode(self):
             pass
-        def exec_actions(self, **kwargs):
-            submissions.append(kwargs)
+        def exec_actions(self, actions, timestamps, compensate_latency):
+            submissions.append(dict(actions=actions, timestamps=timestamps, compensate_latency=compensate_latency))
+            return timestamps
     class Client:
         metadata = {}
         def __init__(self, *args, **kwargs):
@@ -384,18 +392,25 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
     tree = ast.parse((ROOT/entry).read_text())
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
     fn.decorator_list = []
-    keys = iter([{'c'}, set(), set(), set(), {'q'}])
+    keys = iter([set(), set(), set(), {'c'}, set(), set(), set(), {'q'}])
     cv = types.SimpleNamespace(INTER_AREA=3, FONT_HERSHEY_SIMPLEX=0,
                                resize=lambda image, *a, **kw: image.copy(),
                                imwrite=lambda *a: True, imshow=lambda *a: None, pollKey=lambda: -1,
                                putText=lambda *a, **kw: None, setNumThreads=lambda *a: None)
     monkeypatch.setitem(sys.modules, 'cv2', cv)
-    raw_keys = iter([['c'], [], ['q']])
+    class FakeKey:
+        def __init__(self, char):
+            self.char = char
+        def __eq__(self, other):
+            return isinstance(other, FakeKey) and self.char == other.char
+    raw_keys = iter([[], [], [], [FakeKey('c')], [], [], [FakeKey('q')]])
     counter = types.SimpleNamespace(get_press_events=lambda: next(raw_keys))
-    ns = dict(vars(bp), os=os, sys=sys, time=time, json=json, yaml=yaml, click=click, cv2=cv,
+    ns = dict(vars(bp), os=os, sys=sys, time=time, yaml=yaml, click=click, cv2=cv, deque=deque,
+              warmup_pi=deploy.warmup_pi, action_delivery_margin=deploy.action_delivery_margin,
+              select_live_waypoints=deploy.select_live_waypoints,
               st=types.SimpleNamespace(Rotation=Rotation), atexit=atexit,
               SharedMemoryManager=lambda: contextlib.nullcontext(object()),
-              KeystrokeCounter=lambda: contextlib.nullcontext(counter), KeyCode=lambda char: char, BimanualUmiEnv=Env,
+              KeystrokeCounter=lambda: contextlib.nullcontext(counter), KeyCode=FakeKey, BimanualUmiEnv=Env,
               PolicyClient=Client, wait_robot_ready=lambda r: None,
               restore_initial_gripper_opening=lambda *a: None, precise_wait=lambda *a, **kw: None,
               read_episode_keys=lambda *a: next(keys), wait_pending_actions=lambda *a: None,
@@ -405,17 +420,17 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
     exec(compile(ast.Module(body=stop_functions + [fn], type_ignores=[]), entry, 'exec'), ns)
     # Avoid the fixed startup sleep while retaining real wall-clock timestamps.
     ns['time'] = types.SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=lambda *a: None)
-    ns['main'](None, None, None, str(tmp_path/'output'), str(cfg), None, 0, False,
-               1, 60, 1, None, None, 2, False, False, False, 8, debug, True)
-    assert len(requests) == 1 and len(requests[0][0]) == count
+    args = (None, None, None, str(tmp_path/'output'), str(cfg), None, 0, False)
+    if entry == 'policy_client_pi.py':
+        ns['main'](*args, 1, 60, 1, None, None, 2, False, False, False, 8)
+    else:
+        ns['main'](*args, 2, 60, 2, None, None, False, False, False, 8)
+    assert len(requests) == 3 and len(requests[0][0]) == count
     assert requests[0][1].shape == (10 * count,)
-    assert len(submissions) == (0 if debug else 1)
-    if submissions:
-        assert submissions[0]['actions'].shape == (2, 7 * count)
-    captures = list((tmp_path/'output'/'policy_io').glob('run_*/*_execution.npz'))
-    assert len(captures) == 1
-    with np.load(captures[0]) as saved:
-        assert saved['decoded_actions'].shape == (32, 7 * count)
+    assert len(submissions) == 1
+    assert submissions[0]['actions'].shape == (2, 7 * count)
+    assert not (tmp_path/'output'/'policy_io').exists()
+
 
 
 def test_layout_is_implicit_and_default_order_is_right_left():
@@ -489,19 +504,21 @@ def test_nonfinite_translation_or_gripper_rejected(value):
             unpack_actions(actions, 2)
 
 
-@pytest.mark.parametrize('entry', ['policy_client_pi.py', 'policy_client_pi_episodes.py'])
-@pytest.mark.parametrize('has_actions', [False, True])
-def test_episode_recording_cleanup_handles_empty_and_nonempty_actions(entry, has_actions):
-    fn = load_collision(entry, 'finish_episode_recording')
+def test_video_recording_cleanup_is_idempotent_and_preserves_episodes(tmp_path):
+    env, _ = make_env()
     events = []
-    env = types.SimpleNamespace(
-        obs_accumulator=types.SimpleNamespace(timestamps={'robot': np.array([1.])}),
-        action_accumulator=types.SimpleNamespace(timestamps=np.array([1.]) if has_actions else np.array([])),
-        camera=types.SimpleNamespace(stop_recording=lambda: events.append('stop')),
-        end_episode=lambda: events.append('save'))
-    fn(env)
-    assert events == (['save'] if has_actions else ['stop'])
-    if not has_actions:
-        assert env.obs_accumulator is None and env.action_accumulator is None
-        fn(env)
-        assert events == ['stop']
+    env.video_dir = tmp_path
+    env.video_only = True
+    env._video_recording = False
+    env.camera.restart_put = lambda **kw: None
+    env.camera.start_recording = lambda **kw: events.append(kw['video_path'])
+    env.camera.stop_recording = lambda: events.append('stop')
+    for timestamp in (100., 101.):
+        env.start_episode(timestamp)
+        env.end_episode()
+        env.end_episode()
+    assert events[1::2] == ['stop', 'stop']
+    assert len(events[0]) == len(events[2]) == 2
+    assert events[0][0] != events[2][0]
+    assert all(path.endswith('.mp4') for paths in events[::2] for path in paths)
+    assert env.obs_accumulator is None and env.action_accumulator is None

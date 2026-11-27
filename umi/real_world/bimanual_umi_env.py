@@ -3,6 +3,7 @@ import pathlib
 import numpy as np
 import time
 import shutil
+import tempfile
 import math
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
@@ -60,15 +61,16 @@ class BimanualUmiEnv:
             multi_cam_vis_resolution=(960, 960),
             # shared memory
             shm_manager=None,
-            cameras_config=None
+            cameras_config=None,
+            video_only=False,
             ):
         output_dir = pathlib.Path(output_dir)
-        assert output_dir.parent.is_dir()
         video_dir = output_dir.joinpath('videos')
         video_dir.mkdir(parents=True, exist_ok=True)
-        zarr_path = str(output_dir.joinpath('replay_buffer.zarr').absolute())
-        replay_buffer = ReplayBuffer.create_from_path(
-            zarr_path=zarr_path, mode='a')
+        replay_buffer = None
+        if not video_only:
+            zarr_path = str(output_dir.joinpath('replay_buffer.zarr').absolute())
+            replay_buffer = ReplayBuffer.create_from_path(zarr_path=zarr_path, mode='a')
 
         if shm_manager is None:
             shm_manager = SharedMemoryManager()
@@ -315,6 +317,8 @@ class BimanualUmiEnv:
         self.output_dir = output_dir
         self.video_dir = video_dir
         self.replay_buffer = replay_buffer
+        self.video_only = video_only
+        self._video_recording = False
         # temp memory buffers
         self.last_camera_data = None
         # recording buffers
@@ -351,19 +355,21 @@ class BimanualUmiEnv:
             self.start_wait()
 
     def stop(self, wait=True):
-        self.end_episode()
-        if self.multi_cam_vis is not None:
-            self.multi_cam_vis.stop(wait=False)
-        for robot in self.robots:
-            robot.stop(wait=False)
-        for gripper, gc in zip(self.grippers, self.grippers_config):
-            if gc.get('gripper_type', 'wsg') == 'custom':
-                gripper.stop()
-            else:
-                gripper.stop(wait=False)
-        self.camera.stop(wait=False)
-        if wait:
-            self.stop_wait()
+        try:
+            self.end_episode()
+        finally:
+            if self.multi_cam_vis is not None:
+                self.multi_cam_vis.stop(wait=False)
+            for robot in self.robots:
+                robot.stop(wait=False)
+            for gripper, gc in zip(self.grippers, self.grippers_config):
+                if gc.get('gripper_type', 'wsg') == 'custom':
+                    gripper.stop()
+                else:
+                    gripper.stop(wait=False)
+            self.camera.stop(wait=False)
+            if wait:
+                self.stop_wait()
 
     def start_wait(self):
         self.camera.start_wait()
@@ -572,47 +578,47 @@ class BimanualUmiEnv:
         if not isinstance(timestamps, np.ndarray):
             timestamps = np.array(timestamps)
 
-        # convert action to pose
-        receive_time = time.time()
-        delivery_latency = 0.0
-        if compensate_latency:
-            delivery_latency = max(
-                [0.0] + [float(rc['robot_action_latency']) for rc in self.robots_config]
-                + [float(gc['gripper_action_latency']) for gc in self.grippers_config
-                   if gc.get('gripper_type', 'wsg') != 'custom'])
-        is_new = timestamps > receive_time + delivery_latency
-        new_actions = actions[is_new]
-        new_timestamps = timestamps[is_new]
+        if actions.ndim != 2 or actions.shape != (timestamps.size, 7 * len(self.robots)):
+            raise ValueError("Expected one timestamp and seven action values per arm for each row")
+        if timestamps.ndim != 1 or not np.isfinite(actions).all() or not np.isfinite(timestamps).all():
+            raise ValueError("Action rows and timestamps must be finite")
+        if np.any(np.diff(timestamps) <= 0):
+            raise ValueError("Action timestamps must be strictly increasing")
 
-        assert new_actions.shape[1] // len(self.robots) == 7
-        assert new_actions.shape[1] % len(self.robots) == 0
+        robot_delays = [float(rc.get('robot_action_latency', 0)) if compensate_latency else 0.0
+                        for rc in self.robots_config]
+        gripper_delays = [float(gc.get('gripper_action_latency', 0)) if compensate_latency else 0.0
+                          for gc in self.grippers_config]
+        if any(not math.isfinite(delay) or delay < 0 for delay in robot_delays + gripper_delays):
+            raise ValueError("Action latency must be finite and non-negative")
+        earliest = time.time() + max([0.0] + robot_delays + gripper_delays)
+        keep = timestamps > earliest
+        new_actions, new_timestamps = actions[keep], timestamps[keep]
+        if not len(new_timestamps):
+            return new_timestamps
 
-        # schedule waypoints
-        for i in range(len(new_actions)):
-            for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(
-                    self.robots, self.grippers, self.robots_config, self.grippers_config)):
-                r_latency = rc['robot_action_latency'] if compensate_latency else 0.0
-                g_latency = gc['gripper_action_latency'] if compensate_latency else 0.0
-                r_actions = new_actions[i, 7 * robot_idx + 0: 7 * robot_idx + 6]
-                g_actions = new_actions[i, 7 * robot_idx + 6]
+        for i, new_time in enumerate(new_timestamps):
+            for arm, (robot, gripper, gc) in enumerate(zip(self.robots, self.grippers, self.grippers_config)):
                 robot.schedule_waypoint(
-                    pose=r_actions,
-                    target_time=new_timestamps[i] - r_latency
+                    pose=new_actions[i, 7 * arm:7 * arm + 6],
+                    target_time=new_time - robot_delays[arm],
                 )
-                if gc.get('gripper_type', 'wsg') == 'custom':
-                    # Preserve this driver's first-width-per-chunk behavior.
-                    if i == 0:
-                        gripper.move_gripper(g_actions, force_limit_nm=float(gc.get('force_limit_nm', 1.5)))
-                else:
-                    gripper.schedule_waypoint(pos=g_actions, target_time=new_timestamps[i] - g_latency)
+                if gc.get('gripper_type', 'wsg') != 'custom':
+                    gripper.schedule_waypoint(
+                        pos=new_actions[i, 7 * arm + 6], target_time=new_time - gripper_delays[arm]
+                    )
+        for arm, (gripper, gc) in enumerate(zip(self.grippers, self.grippers_config)):
+            if gc.get('gripper_type', 'wsg') == 'custom':
+                gripper.schedule_waypoints(
+                    widths_m=new_actions[:, 7 * arm + 6],
+                    target_times=new_timestamps - gripper_delays[arm],
+                    force_limit_nm=float(gc.get('force_limit_nm', 1.5)),
+                )
 
-        # record actions
         if self.action_accumulator is not None:
-            self.action_accumulator.put(
-                new_actions,
-                new_timestamps
-            )
-    
+            self.action_accumulator.put(new_actions, new_timestamps)
+        return new_timestamps
+
     def get_robot_state(self):
         return [robot.get_state() for robot in self.robots]
     
@@ -630,10 +636,14 @@ class BimanualUmiEnv:
 
         assert self.is_ready
 
-        # prepare recording stuff
-        episode_id = self.replay_buffer.n_episodes
-        this_video_dir = self.video_dir.joinpath(str(episode_id))
-        this_video_dir.mkdir(parents=True, exist_ok=True)
+        if self.video_only:
+            if self._video_recording:
+                raise RuntimeError("An episode is already recording")
+            this_video_dir = pathlib.Path(tempfile.mkdtemp(prefix='episode_', dir=self.video_dir))
+        else:
+            episode_id = self.replay_buffer.n_episodes
+            this_video_dir = self.video_dir.joinpath(str(episode_id))
+            this_video_dir.mkdir(parents=True, exist_ok=True)
         n_cameras = self.camera.n_cameras
         video_paths = list()
         for i in range(n_cameras):
@@ -643,6 +653,11 @@ class BimanualUmiEnv:
         # start recording on camera
         self.camera.restart_put(start_time=start_time)
         self.camera.start_recording(video_path=video_paths, start_time=start_time)
+
+        if self.video_only:
+            self._video_recording = True
+            print(f'First-person recording: {this_video_dir}', flush=True)
+            return
 
         # create accumulators
         self.obs_accumulator = ObsAccumulator()
@@ -654,6 +669,11 @@ class BimanualUmiEnv:
     
     def end_episode(self):
         "Stop recording"
+        if self.video_only:
+            if self._video_recording:
+                self.camera.stop_recording()
+                self._video_recording = False
+            return
         assert self.is_ready
         
         # stop video recorder
@@ -717,6 +737,8 @@ class BimanualUmiEnv:
             self.action_accumulator = None
 
     def drop_episode(self):
+        if self.video_only:
+            raise RuntimeError("Replay deletion is unavailable in video-only mode")
         self.end_episode()
         self.replay_buffer.drop_episode()
         episode_id = self.replay_buffer.n_episodes

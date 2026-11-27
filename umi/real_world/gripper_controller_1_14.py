@@ -72,6 +72,8 @@ class GripperController:
 
         self.thread = None
         self.command_queue = queue.Queue()
+        self._waypoint_lock = threading.Lock()
+        self._waypoints = deque()
 
         self.current_position_rad = 0.0
         self.current_vel = 0.0
@@ -135,25 +137,61 @@ class GripperController:
             vel = self.current_vel
             force = self.current_torque_nm
             return [width, vel, force, gripper_timestamp, 0, 0, 0]
+    def schedule_waypoints(self, widths_m, target_times, *, force_limit_nm):
+        """Queue future setpoints on the same clock as robot endpoints."""
+        if self.mode != 'single':
+            raise ValueError("Scheduled gripper motion requires single mode")
+        times = [float(t) for t in target_times]
+        angles = [self._width_to_angle(float(w)) for w in widths_m]
+        force = float(force_limit_nm)
+        if not times or len(times) != len(angles) or not all(map(math.isfinite, times + angles + [force])):
+            raise ValueError("Invalid gripper waypoint chunk")
+        if force <= 0 or any(b <= a for a, b in zip(times, times[1:])):
+            raise ValueError("Gripper waypoint times must increase and force must be positive")
+
+        with self._waypoint_lock:
+            # Preserve preceding commands and replace overlapping unissued ones.
+            while self._waypoints and self._waypoints[-1][0] >= times[0]:
+                self._waypoints.pop()
+            self._waypoints.extend((t, a, force) for t, a in zip(times, angles))
+
+    def has_pending_waypoints(self):
+        with self._waypoint_lock:
+            return bool(self._waypoints)
+
+    def _pop_due_waypoint(self, now):
+        result = None
+        with self._waypoint_lock:
+            while self._waypoints and self._waypoints[0][0] <= now:
+                _, angle, force = self._waypoints.popleft()
+                result = ('move', angle, force)
+        # If the motor loop stalls, apply the newest due target, without a burst.
+        return result
+
+    def _queue_manual_command(self, command):
+        with self._waypoint_lock:
+            self._waypoints.clear()
+            self.command_queue.put(command)
+
     def move_gripper(self, width_m: float, force_limit_nm: float):
         if self.mode != 'single':
             print("[错误] move_gripper 只能在 'single' 模式下使用。")
             return
         target_rad = self._width_to_angle(width_m)
-        self.command_queue.put(('move', target_rad, abs(force_limit_nm)))
+        self._queue_manual_command(('move', target_rad, abs(force_limit_nm)))
         print(f"指令已发送: 移动到宽度 {width_m*1000:.2f} mm (角度: {target_rad:.3f} rad) 力限制: {abs(force_limit_nm):.2f} Nm")
 
     def move_gripper_force(self, force_limit_nm: float, close_speed_dps: float = 30.0):
         if self.mode != 'single':
             print("[错误] move_gripper_force 只能在 'single' 模式下使用。")
             return
-        self.command_queue.put(('grasp', abs(force_limit_nm), abs(close_speed_dps)))
+        self._queue_manual_command(('grasp', abs(force_limit_nm), abs(close_speed_dps)))
         print(f"指令已发送: 夹持至力矩达到 {abs(force_limit_nm):.2f} Nm")
     def stop_gripper(self):
         if self.mode != 'single':
             print("[警告] stop_gripper 只在 'single' 模式下有效。")
             return
-        self.command_queue.put(('stop',))
+        self._queue_manual_command(('stop',))
         print("[事件] 停止指令已发送。")
     def _run(self):
         if self.mode == 'dual':
@@ -179,9 +217,18 @@ class GripperController:
         control_state = 'IDLE'
         desired_position_rad = 0.0
         actual_target_position_rad = 0.0
+        force_limit_nm = self.TORQUE_LIMIT_SINGLE
 
         while running:
             loop_start = time.perf_counter()
+
+            # Feed exactly the newest due waypoint into this control cycle.
+            due = self._pop_due_waypoint(time.time())
+            if due is not None:
+                _, desired_position_rad, force_limit_nm = due
+                if control_state == 'IDLE':
+                    actual_target_position_rad = self.current_position_rad
+                control_state = 'POSITION_MODE'
 
             # 处理命令
             while running:
@@ -200,6 +247,9 @@ class GripperController:
                         # Start from feedback when preserving an existing zero.
                         actual_target_position_rad = self.current_position_rad
                     control_state = 'POSITION_MODE'
+                elif cmd_type == 'stop':
+                    control_state = 'IDLE'
+                    self.motor1.stop()
 
             if not running:
                 continue
@@ -238,13 +288,13 @@ class GripperController:
                 vel_error = 0.0 - vel_rad_s
 
                 torque_cmd = self.KP * pos_error + self.KD * vel_error
-                torque_cmd = max(-self.TORQUE_LIMIT_SINGLE, min(self.TORQUE_LIMIT_SINGLE, torque_cmd))
+                limit = min(self.TORQUE_LIMIT_SINGLE, force_limit_nm)
+                torque_cmd = max(-limit, min(limit, torque_cmd))
 
                 self.motor1.set_torque_nm(torque_cmd)
-                elapsed = time.perf_counter() - loop_start
-                remaining_time = self.DT - elapsed
-                if remaining_time > 0:
-                    time.sleep(remaining_time)
+            remaining_time = self.DT - (time.perf_counter() - loop_start)
+            if remaining_time > 0:
+                time.sleep(remaining_time)
 
         self.motor1.stop()
         print("单电机控制循环已停止。")
@@ -335,7 +385,7 @@ class GripperController:
     def stop(self):
         print("正在停止控制循环...")
         if self.thread and self.thread.is_alive():
-            self.command_queue.put(('shutdown',))
+            self._queue_manual_command(('shutdown',))
             self.thread.join(timeout=2.0)
             if self.thread.is_alive():
                 print("[警告] 控制线程未能正常结束。")

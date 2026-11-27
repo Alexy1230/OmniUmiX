@@ -42,6 +42,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
 from umi.real_world.bimanual_umi_env import BimanualUmiEnv
+from umi.real_world.client_deployment import warmup_requests
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
 from umi.common.precise_sleep import precise_wait
 from umi.common.pose_util import pose_to_mat, mat_to_pose
@@ -180,25 +181,25 @@ class PolicyClient:
                 timeout=30
             )
             resp.raise_for_status()
-            
+
             # --- 修改开始 ---
             if USE_JSON_NUMPY and json_numpy is not None:
                 # 使用 json_numpy 解析，它会自动识别 {"__numpy__": ...} 并还原成真正的 ndarray
                 result = json_numpy.loads(resp.text)
             else:
                 result = json.loads(resp.text)
-            
+
             # 确保获取的是 action 键
             action = result["action"]
-            
+
             # 关键一步：如果服务器返回的是经过序列化的字典，而 loads 没能自动转换
             if isinstance(action, dict) and "__numpy__" in action:
                 import json_numpy
                 action = json_numpy.decode(action)
-                
+
             return np.array(action)
             # --- 修改结束 ---
-            
+
             # result = json.loads(resp.text)
             # return np.array(result["action"])
         except Exception as e:
@@ -207,6 +208,34 @@ class PolicyClient:
 
 
 # ============ 主函数 ============
+
+def build_legacy_observation(obs, num_robots, episode_start_pose, tx_robot1_robot0):
+    # 构建发送给服务器的观测字典 - 使用服务器期望的格式
+    # 服务器期望: fisheye_img, left_robot_tcp_xyzrpy (xyz+rpy), left_robot_gripper_width_for_action
+    eef_pos = obs['robot0_eef_pos']  # (T, 3)
+    eef_rot_aa = obs['robot0_eef_rot_axis_angle']  # (T, 3) axis-angle
+    eef_rot_rpy = axis_angle_to_rpy(eef_rot_aa)  # 转换为 RPY
+    xyzrpy = np.concatenate([eef_pos, eef_rot_rpy], axis=-1)  # (T, 6)
+
+    server_obs = {
+        'fisheye_img': obs['camera0_rgb'],  # (T, H, W, C)
+        'left_robot_tcp_xyzrpy': xyzrpy,  # (T, 6) xyz + rpy
+        'left_robot_gripper_width_for_action': obs['robot0_gripper_width'],  # (T, 1)
+        'episode_start_pose': episode_start_pose,
+        'tx_robot1_robot0': tx_robot1_robot0.tolist() if isinstance(tx_robot1_robot0, np.ndarray) else tx_robot1_robot0,
+    }
+
+    # 如果是双臂，添加第二个机器人的观测
+    if num_robots > 1:
+        eef_pos1 = obs['robot1_eef_pos']
+        eef_rot_aa1 = obs['robot1_eef_rot_axis_angle']
+        eef_rot_rpy1 = axis_angle_to_rpy(eef_rot_aa1)
+        xyzrpy1 = np.concatenate([eef_pos1, eef_rot_rpy1], axis=-1)
+        server_obs['right_robot_tcp_xyzrpy'] = xyzrpy1
+        server_obs['right_robot_gripper_width_for_action'] = obs['robot1_gripper_width']
+
+    return server_obs
+
 
 @click.command()
 @click.option('--server-url', '-s', required=True, help='Policy server URL (e.g., http://192.168.1.100:8099)')
@@ -262,6 +291,7 @@ def main(server_url, output, robot_config,
         with KeystrokeCounter() as key_counter, \
             BimanualUmiEnv(
                 output_dir=output,
+                video_only=True,
                 robots_config=robots_config,
                 grippers_config=grippers_config,
                 frequency=frequency,
@@ -316,22 +346,22 @@ def main(server_url, output, robot_config,
                     #     0.467959, -0.004394, 0.154206,      # x, y, z position
                     #     -1.663930, 1.561844, -0.925636     # axis-angle rotation
                     # ])
-                    
+
                     # target_home_pose = np.array([
                     #      0.497524, 0.037813, 0.212450,      # x, y, z position
                     #     -1.450700, 1.597360, -1.181150     # axis-angle rotation
                     # ])
-                    
+
                     # target_home_pose = np.array([
                     #      0.555839, -0.081934, 0.221995,      # x, y, z position
                     #     -2.116637, 0.819526, -0.431101     # axis-angle rotation
                     # ])
-                    
+
                     target_home_pose = np.array([
                          0.508993, -0.078624, 0.132818,      # x, y, z position
                         -2.732883, 0.632504, -0.124448     # axis-angle rotation
                     ])
-                    
+
                     print(f"Target home pose: {target_home_pose}")
 
                     # Move robot using servoL
@@ -356,6 +386,18 @@ def main(server_url, output, robot_config,
                     traceback.print_exc()
 
             print("\n" + "=" * 60)
+            def warm_legacy(obs):
+                start_poses = [
+                    np.r_[obs[f'robot{i}_eef_pos'][-1], obs[f'robot{i}_eef_rot_axis_angle'][-1]]
+                    for i in range(num_robots)
+                ]
+                policy_client.call_server(build_legacy_observation(obs, num_robots, start_poses, tx_robot1_robot0))
+
+            if not warmup_requests(
+                env, warm_legacy,
+                lambda: {key.char for key in key_counter.get_press_events() if isinstance(key, KeyCode)},
+            ):
+                return
             print("Ready! Press 'C' to start policy, 'Q' to quit")
             print("=" * 60)
 
@@ -433,43 +475,18 @@ def main(server_url, output, robot_config,
                         obs_timestamps = obs['timestamp']
                         print(f'Obs latency: {time.time() - obs_timestamps[-1]:.3f}s')
 
-                        # 构建发送给服务器的观测字典 - 使用服务器期望的格式
-                        # 服务器期望: fisheye_img, left_robot_tcp_xyzrpy (xyz+rpy), left_robot_gripper_width_for_action
-                        eef_pos = obs['robot0_eef_pos']  # (T, 3)
-                        eef_rot_aa = obs['robot0_eef_rot_axis_angle']  # (T, 3) axis-angle
-                        eef_rot_rpy = axis_angle_to_rpy(eef_rot_aa)  # 转换为 RPY
-                        xyzrpy = np.concatenate([eef_pos, eef_rot_rpy], axis=-1)  # (T, 6)
-
-                        server_obs = {
-                            'fisheye_img': obs['camera0_rgb'],  # (T, H, W, C)
-                            'left_robot_tcp_xyzrpy': xyzrpy,  # (T, 6) xyz + rpy
-                            'left_robot_gripper_width_for_action': obs['robot0_gripper_width'],  # (T, 1)
-                            'episode_start_pose': episode_start_pose,
-                            'tx_robot1_robot0': tx_robot1_robot0.tolist() if isinstance(tx_robot1_robot0, np.ndarray) else tx_robot1_robot0,
-                        }
-
-                        # 如果是双臂，添加第二个机器人的观测
-                        if num_robots > 1:
-                            eef_pos1 = obs['robot1_eef_pos']
-                            eef_rot_aa1 = obs['robot1_eef_rot_axis_angle']
-                            eef_rot_rpy1 = axis_angle_to_rpy(eef_rot_aa1)
-                            xyzrpy1 = np.concatenate([eef_pos1, eef_rot_rpy1], axis=-1)
-                            server_obs['right_robot_tcp_xyzrpy'] = xyzrpy1
-                            server_obs['right_robot_gripper_width_for_action'] = obs['robot1_gripper_width']
-
+                        server_obs = build_legacy_observation(
+                            obs, num_robots, episode_start_pose, tx_robot1_robot0)
                         # 调用服务器获取动作
                         s = time.time()
                         raw_action = policy_client.call_server(server_obs)
-                        
-                        # print(f"DEBUG: raw_action type: {type(raw_action)}")
-                        # print(f"DEBUG: raw_action value: {raw_action}")
-                        # if isinstance(raw_action, np.ndarray):
+
                         #     print(f"DEBUG: raw_action shape: {raw_action.shape}")
 
                         if raw_action is None or np.array(raw_action).size == 0:
                             print("Warning: Received empty action from server!")
                             continue
-                        
+
                         inference_time = time.time() - s
                         print(f'Network latency: {inference_time:.3f}s')
 
@@ -543,10 +560,7 @@ def main(server_url, output, robot_config,
                             action_exec_latency = 0.01
                             curr_time = time.time()
                             is_new = action_timestamps > (curr_time + action_exec_latency)
-                            
-                            # print(f"DEBUG: action_timestamps range: {action_timestamps[0]} to {action_timestamps[-1]}")
-                            # print(f"DEBUG: current_time: {curr_time}")
-                            # print(f"DEBUG: num_new_actions: {np.sum(is_new)}")
+
 
                             if np.sum(is_new) == 0:
                                 this_target_poses = this_target_poses[[-1]]

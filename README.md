@@ -20,10 +20,28 @@ chosen client; follow the guides and inspect the matching configuration under
 
 All current variants are retained: `policy_client_pi.py`,
 `policy_client_pi_wolatency.py`, `policy_client_pi_episodes.py`,
-`policy_client_pi_proprio_episodes.py`, `policy_client_gripper_tuned.py`,
+`policy_client_pi_proprio_episodes.py`,
+`policy_client_pi_proprio_wolatency.py`, `policy_client_gripper_tuned.py`,
 `zero_action_client_pi.py`, `umi_policy_client.py`, and
 `example/continuous_client.py`. Their names alone do not establish obsolescence.
 `teleop_interface.py` provides a separate teleoperation entry point.
+
+
+## Episode deployment
+
+`policy_client_pi_episodes.py` and `policy_client_pi_proprio_episodes.py`
+take `--frequency` and `--steps-per-inference`. With 20 Hz and 8 steps,
+each request starts at least 0.4 s after the previous request started.
+Each reply supplies up to 8 new waypoints with enough remaining lead for
+both the arms and grippers. `--max-timesteps` counts submitted waypoints.
+The sequential `*_wolatency.py` clients take `--exec-horizon-steps` as
+the chunk length and request a fresh observation after playback.
+
+Startup warms the server with two hardware observations. Inference results
+from warmup are discarded. C starts an episode, S ends it after submitted
+targets finish, R returns to the configured home while idle, and Q exits.
+Episode output is one first-person MP4 per configured camera under
+`<output>/videos/episode_*/`.
 
 ## Repository layout
 
