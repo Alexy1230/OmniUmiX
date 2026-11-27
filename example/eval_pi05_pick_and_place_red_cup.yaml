@@ -1,6 +1,27 @@
 {
   # OpenPI pi05 lift-bottle profile, adapted from OmniUmiX.
   "policy": {
+    "protocol": "ftp1_umi",
+    "save_tactile_images": true,
+    "tactile": {
+        "enabled": true,
+        "python": "/home/xcr/miniconda3/envs/omniumix_lerobot_v21/bin/python",
+        "startup_timeout_s": 30.0,
+        "timeout_s": 5.0,
+        "max_stale_s": 1.0,
+        "infer_mode": "normal",
+        "runtime_mode": "calibrate",
+        "runtime_directory": null,
+        "record_force": false,
+        "left": {
+            "serial": "",
+            "runtime_path": null
+        },
+        "right": {
+            "serial": "",
+            "runtime_path": null
+        }
+    },
     "server_url": "ws://127.0.0.1:8099",
     "prompt": "Pick up the red cup and place it on the yellow plate.",
     "request_timeout_s": 30.0,
@@ -79,7 +100,8 @@
   # gripper configurations, 0->right 1->left
   "grippers": [
     {
-      "gripper_type": "custom",  # Use custom gripper (gripper_controller_1_14.py)
+      "gripper_type": "custom",
+      "homing": {"enabled": true, "torque_nm": -0.05, "timeout_s": 2.0, "velocity_threshold_rad_s": 0.05, "stall_samples": 10, "min_duration_s": 0.2},  # Use custom gripper (gripper_controller_1_14.py)
       "port": "/dev/ttyUSB3",
       "motor_id": 1,            # Motor 1 ID
       "mode": "single",          # "single" or "dual"

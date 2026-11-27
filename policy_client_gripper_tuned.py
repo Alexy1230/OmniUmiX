@@ -237,7 +237,9 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
     # Load robot config
     robot_config_data = yaml.safe_load(open(os.path.expanduser(robot_config), 'r'))
-    policy_config = robot_config_data.get('policy', {})
+    policy_config = dict(robot_config_data.get('policy', {}))
+    policy_config['capture_dir'] = output
+    policy_config['gripper_calibration'] = [gc.get('width_to_rad') for gc in robot_config_data['grippers']]
     server_url = server_url or policy_config.get('server_url')
     prompt = prompt if prompt is not None else policy_config.get('prompt', '')
     request_timeout = request_timeout or float(policy_config.get('request_timeout_s', 30.0))
@@ -255,7 +257,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     from umi.real_world.mvs_camera_config import camera_configs_from_yaml
     cameras_config = camera_configs_from_yaml(robot_config_data)
     num_robots = len(robots_config)
-    validate_hardware_config(robots_config, grippers_config)
+    validate_hardware_config(robots_config, grippers_config, policy_config)
     options = policy_options(policy_config, num_robots)
     hardware_to_model_gripper_scale, model_to_hardware_gripper_scale = configure_gripper_conversion(
         grippers_config, hardware_to_model_gripper_scale, model_to_hardware_gripper_scale, options)
@@ -453,6 +455,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
                         # Server-client communication
                         s = time.time()
+                        policy_client.observation_timestamp = float(obs['timestamp'][-1])
                         raw_action = policy_client.call_server(images, current_state)
                         response_received_at = time.time()
 

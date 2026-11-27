@@ -359,24 +359,42 @@ class GripperController:
                 else:
                     logger.info(f"[警告] 循环执行超时!耗时: {elapsed*1000:.2f}ms, 目标 DT: {self.DT*1000:.0f}ms")
 
-    def start(self, reset_zero=True):
+    def start(self, reset_zero=True, homing=None):
         if self.thread is not None and self.thread.is_alive():
             print("控制器已经启动。")
             return
+        homing = homing or {}
+        if not isinstance(homing.get('enabled', False), bool):
+            raise ValueError('homing.enabled must be a YAML boolean')
+        if homing.get('enabled', False) and self.mode != 'single':
+            raise ValueError('Use one single-motor controller per gripper for homing')
+        if homing.get('enabled', False) and self.width_calibration is not None:
+            # The saved calibration's minimum angle must correspond to RAM zero.
+            scale, offset, low, _ = self.width_calibration
+            if abs(low * scale + offset) > 1e-8:
+                raise ValueError('Homing requires width_to_rad.min_rad=0')
         print("启动电机...")
-        self.motor1.enable()
-        time.sleep(1)
-        if self.mode == 'dual':
-            self.motor2.enable()
-            time.sleep(1)
-
-        if reset_zero:
-            print("设置当前位置为零点...")
-            self.motor1.set_zero_ram()
-            time.sleep(2)
-            if self.mode == 'dual':
-                self.motor2.set_zero_ram()
-                time.sleep(2)
+        motors = [self.motor1] + ([self.motor2] if self.mode == 'dual' else [])
+        try:
+            for motor in motors:
+                motor.enable()
+                time.sleep(1)
+            if homing.get('enabled', False):
+                from umi.real_world.gripper_homing import home_motor
+                home_motor(self.motor1, homing, self.TORQUE_LIMIT_SINGLE)
+            elif reset_zero:
+                print("设置当前位置为零点...")
+                for motor in motors:
+                    motor.set_zero_ram()
+                    time.sleep(2)
+        except BaseException:
+            for motor in motors:
+                try:
+                    motor.set_torque_nm(0)
+                    motor.disable()
+                except Exception:
+                    pass
+            raise
 
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()

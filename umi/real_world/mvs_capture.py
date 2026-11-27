@@ -18,6 +18,10 @@ import numpy as np
 from umi.real_world.mvs_camera_config import resize_image
 
 
+class MvsFrameTimeout(TimeoutError):
+    """The SDK delivered no frame before the configured capture deadline."""
+
+
 def crop_with_black_padding(image, config):
     """Crop in rotated-frame coordinates; missing pixels become zero BGR.
 
@@ -198,8 +202,13 @@ class MvsCapture:
     def read(self):
         sdk = self.sdk
         frame = sdk.MV_FRAME_OUT()
-        self._check(self.camera.MV_CC_GetImageBuffer(
-            frame, int(self.config.get('frame_timeout_ms', 1000))), 'get image buffer')
+        timeout_ms = int(self.config.get('frame_timeout_ms', 1000))
+        result = self.camera.MV_CC_GetImageBuffer(frame, timeout_ms)
+        # MV_E_NODATA is a normal timeout condition for the MVS SDK. Do not
+        # tear down the complete camera worker after a single missed frame.
+        if result != 0 and (result & 0xffffffff) == 0x80000007:
+            raise MvsFrameTimeout(f'MVS get image buffer timed out after {timeout_ms} ms')
+        self._check(result, 'get image buffer')
             
         received = time.time()
         try:

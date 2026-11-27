@@ -5,7 +5,7 @@ import traceback
 
 import numpy as np
 
-from umi.real_world.mvs_capture import MvsCapture
+from umi.real_world.mvs_capture import MvsCapture, MvsFrameTimeout
 from umi.real_world.uvc_camera import UvcCamera
 from umi.real_world.multi_uvc_camera import MultiUvcCamera
 from umi.real_world.video_recorder import VideoRecorder
@@ -22,11 +22,29 @@ class MvsCamera(UvcCamera):
         return MvsCapture(self.mvs_config).open()
 
     def _read_capture(self, cap, frame):
-        image, received = cap.read()
-        np.copyto(frame, image)
-        # No hardware exposure timestamp is exposed by this adapter. Both raw
-        # timestamp fields are host receipt time; run() subtracts latency once.
-        return frame, received, received
+        timeout_s = float(self.mvs_config.get('frame_timeout_ms', 1000)) / 1000.0
+        retry_window_s = max(5.0, 3.0 * timeout_s)
+        deadline = time.monotonic() + retry_window_s
+        warned = False
+        while not self.stop_event.is_set():
+            try:
+                image, received = cap.read()
+                np.copyto(frame, image)
+                # No hardware exposure timestamp is exposed by this adapter.
+                # Both raw timestamp fields are host receipt time; run()
+                # subtracts latency once.
+                return frame, received, received
+            except MvsFrameTimeout as exc:
+                if not warned:
+                    print(f'MVS {self.dev_video_path}: {exc}; retrying', flush=True)
+                    warned = True
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f'MVS {self.dev_video_path}: no frame for at least '
+                        f'{retry_window_s:g}s'
+                    ) from exc
+                self.stop_event.wait(0.01)
+        raise RuntimeError(f'MVS {self.dev_video_path}: stopped while waiting for a frame')
 
     def _close_capture(self, cap):
         cap.close()
