@@ -55,7 +55,14 @@ class MultiCameraVisualizer(mp.Process):
         vis_data = None
         vis_img = None
         while not self.stop_event.is_set():
-            vis_data = self.camera.get_vis(out=vis_data)
+            try:
+                vis_data = self.camera.get_vis(out=vis_data)
+            except RuntimeError as exc:
+                # Preview is optional. A momentary MVS/USB stall must not make
+                # this child crash and, historically, take down the service.
+                print(f'[Camera preview] unavailable; retrying: {exc}', flush=True)
+                self.stop_event.wait(0.25)
+                continue
             color = vis_data['color']
             N, H, W, C = color.shape
             assert C == 3

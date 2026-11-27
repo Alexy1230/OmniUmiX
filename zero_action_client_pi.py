@@ -140,68 +140,14 @@ def solve_sphere_collision(ee_poses, robots_config):
 
 # ============ 策略客户端类 ============
 
-class PolicyClient:
-    """OpenPI WebSocket transport with NumPy-aware MessagePack."""
-
-    def __init__(self, server_url: str, prompt: str, timeout: float = 60.0):
-        if server_url.startswith(('http://', 'https://')):
-            raise ValueError("PI05 client requires ws:// or wss://, not the HTTP /dp URL")
-        if not server_url.startswith(('ws://', 'wss://')):
-            server_url = f'ws://{server_url}'
-        self.server_url = server_url.rstrip('/')
-        self.prompt = prompt
-        self.timeout = timeout
-        self.packer = openpi_msgpack_numpy.Packer()
-        self.ws = connect(
-            self.server_url,
-            open_timeout=timeout,
-            close_timeout=min(timeout, 5.0),
-            compression=None,
-            max_size=None,
-        )
-        metadata_message = self.ws.recv(timeout=timeout)
-        self.metadata = openpi_msgpack_numpy.unpackb(metadata_message)
-        keys = list(self.metadata) if isinstance(self.metadata, dict) else type(self.metadata).__name__
-        print(f"OpenPI connected; metadata keys: {keys}")
-
-    def close(self):
-        if self.ws is not None:
-            self.ws.close()
-            self.ws = None
-
-    def call_server(self, image: np.ndarray, state: np.ndarray) -> np.ndarray:
-        payload = {
-            'observation/image': np.asarray(image, dtype=np.uint8),
-            'current_tcp_pose9_gripper': np.asarray(state, dtype=np.float32),
-            'prompt': self.prompt,
-        }
-        try:
-            self.ws.send(self.packer.pack(payload))
-            message = self.ws.recv(timeout=self.timeout)
-            if isinstance(message, str):
-                raise RuntimeError(f"OpenPI server error: {message}")
-            result = openpi_msgpack_numpy.unpackb(message)
-
-            # ==============================================================================================
-            raw_action = result.get('actions', result.get('action')) if isinstance(result, dict) else result
-            # ==============================================================================================
-
-            action = np.asarray(raw_action, dtype=np.float32)
-            if action.ndim == 1:
-                action = action[None]
-            if action.ndim != 2 or action.shape[1] != 10:
-                raise ValueError(f"Expected PI05 actions shaped [T, 10], got {action.shape}")
-            if not np.all(np.isfinite(action)):
-                raise ValueError("PI05 returned non-finite actions")
-            return action
-        except Exception as e:
-            print(f"[PolicyClient] Server error: {e}")
-            return None
-
+from umi.real_world.bimanual_policy import (PolicyClient, policy_options, configure_gripper_conversion, build_observation, decode_actions)
 
 # ============ 主函数 ============
 
-def build_zero_action_observation(obs, obs_image_resolution, hardware_to_model_gripper_scale):
+def build_zero_action_observation(obs, obs_image_resolution, hardware_to_model_gripper_scale, options=None):
+    if options is not None:
+        images, state, poses, _ = build_observation(obs, 1, obs_image_resolution, hardware_to_model_gripper_scale, options)
+        return images[0], state, poses[0]
     image = cv2.resize(
         obs['camera0_rgb'][-1],
         (obs_image_resolution, obs_image_resolution),
@@ -250,7 +196,9 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
     # 加载机器人配置
     robot_config_data = yaml.safe_load(open(os.path.expanduser(robot_config), 'r'))
-    policy_config = robot_config_data.get('policy', {})
+    policy_config = dict(robot_config_data.get('policy', {}))
+    policy_config['capture_dir'] = output
+    policy_config['gripper_calibration'] = [gc.get('width_to_rad') for gc in robot_config_data['grippers']]
     server_url = server_url or policy_config.get('server_url')
     prompt = prompt if prompt is not None else policy_config.get('prompt', '')
     request_timeout = request_timeout or float(policy_config.get('request_timeout_s', 60.0))
@@ -270,7 +218,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     tx_robot1_robot0 = tx_left_right
 
     robots_config = robot_config_data['robots']
-    grippers_config = robot_config_data['grippers']
+    grippers_config = [dict(gc, homing={'enabled': False}, reset_zero=False) for gc in robot_config_data['grippers']]
     from umi.real_world.mvs_camera_config import camera_configs_from_yaml
     cameras_config = camera_configs_from_yaml(robot_config_data)
     num_robots = len(robots_config)
@@ -292,7 +240,11 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     print("=" * 60)
 
     # 创建策略客户端
-    policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout)
+    options = policy_options(policy_config, num_robots)
+    hardware_scales, model_scales = configure_gripper_conversion(
+        grippers_config, hardware_to_model_gripper_scale, model_to_hardware_gripper_scale, options)
+    policy_client = PolicyClient(server_url, prompt=prompt, timeout=request_timeout,
+                                 num_robots=num_robots, policy_config=policy_config)
     atexit.register(policy_client.close)
 
     # 设置下采样步数（默认值）
@@ -343,8 +295,9 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
 
             def warmup_infer(obs):
+                policy_client.capture_phase = 'warmup'
                 image, state, _ = build_zero_action_observation(
-                    obs, obs_image_resolution, hardware_to_model_gripper_scale)
+                    obs, obs_image_resolution, hardware_scales, options)
                 policy_client.call_server(image, state)
 
             if not warmup_requests(
@@ -353,6 +306,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 return
 
             print("\n" + "=" * 60)
+            policy_client.capture_phase = 'policy'
             print("Ready! Press 'C' to start policy, 'Q' to quit")
             print("=" * 60)
 
@@ -431,10 +385,11 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                         print(f'Obs latency: {time.time() - obs_timestamps[-1]:.3f}s')
 
                         image, current_state, current_pose6 = build_zero_action_observation(
-                            obs, obs_image_resolution, hardware_to_model_gripper_scale)
+                            obs, obs_image_resolution, hardware_scales, options)
 
                         # 调用服务器获取动作
                         s = time.time()
+                        policy_client.observation_timestamp = float(obs['timestamp'][-1])
                         raw_action = policy_client.call_server(image, current_state)
 
                         #     print(f"DEBUG: raw_action shape: {raw_action.shape}")
@@ -452,28 +407,12 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                             iter_idx += 1
                             continue
 
-                        absolute_action10 = (
-                            relative_actions_to_absolute_actions(
-                                raw_action,
-                                base_absolute_action=current_state,
-                            )
-                            if action_is_relative
-                            else raw_action
-                        )
-                        absolute_rot_mats = ortho6d_to_rotation_matrix(
-                            absolute_action10[:, 3:9]
-                        )
-                        absolute_rotvec = st.Rotation.from_matrix(
-                            absolute_rot_mats
-                        ).as_rotvec()
-                        action = np.concatenate([
-                            absolute_action10[:, :3],
-                            absolute_rotvec,
-                            absolute_action10[:, 9:10]
-                            * model_to_hardware_gripper_scale,
-                        ], axis=-1)
+                        action = decode_actions(raw_action, np.asarray([current_pose6]), model_scales, action_is_relative, options)
                         action_horizon = action.shape[0]
-                        all_time_actions[[iter_idx], iter_idx:iter_idx + action_horizon] = action
+                        required_steps = max_timesteps + action_horizon
+                        if all_time_actions.shape[1] < required_steps:
+                            all_time_actions = np.pad(all_time_actions, ((0,0),(0,required_steps-all_time_actions.shape[1]),(0,0)))
+                        all_time_actions[iter_idx, iter_idx:iter_idx + action_horizon] = action
 
                         if inference_idx >= steps_per_inference:
                             inference_idx = 0
@@ -491,7 +430,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                                         k = -0.01
                                         exp_weights = np.exp(k * np.arange(len(actions_for_curr_step)))
                                         exp_weights = exp_weights / exp_weights.sum()
-                                        weighted_rotvec = R.from_rotvec(np.array(actions_for_curr_step)[:, 3:6]).mean(weights=exp_weights).as_rotvec()
+                                        weighted_rotvec = st.Rotation.from_rotvec(np.array(actions_for_curr_step)[:, 3:6]).mean(weights=exp_weights).as_rotvec()
                                         weighted_action = (actions_for_curr_step * exp_weights[:, np.newaxis]).sum(axis=0, keepdims=True)
                                         weighted_action[0][3:6] = weighted_rotvec
                                         target_pose_list.append(weighted_action)

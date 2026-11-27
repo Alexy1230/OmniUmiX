@@ -424,8 +424,10 @@ def test_episode_main_one_complete_iteration_with_fake_hardware(tmp_path, monkey
     if entry == 'policy_client_pi.py':
         ns['main'](*args, 1, 60, 1, None, None, 2, False, False, False, 8)
     else:
-        ns['main'](*args, 2, 60, 2, None, None, False, False, False, 8)
-    assert len(requests) == 3 and len(requests[0][0]) == count
+        ns['main'](*args, 2, 60, 2, None, None, 2, False, False, False, 8)
+    # Naive episodes infer every loop, including the iteration stopped after inference.
+    assert len(requests) == (4 if entry == 'policy_client_pi_episodes.py' else 3)
+    assert len(requests[0][0]) == count
     assert requests[0][1].shape == (10 * count,)
     assert len(submissions) == 1
     assert submissions[0]['actions'].shape == (2, 7 * count)

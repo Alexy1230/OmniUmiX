@@ -1,3 +1,7 @@
+# sort_diff tactile client — new_deployment baseline
+
+使用说明：[FTP1_TACTILE_DEPLOY.md](docs/FTP1_TACTILE_DEPLOY.md)。
+
 # Omni robot policy clients
 
 This repository contains robot policy clients, camera services, calibration tools,

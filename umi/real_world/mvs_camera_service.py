@@ -241,17 +241,33 @@ def serve(camera, address, parent_pid, max_frame_age=5.0):
     """Serve only the camera contract, never arbitrary attribute/method access."""
     allowed = {'get', 'get_vis', 'restart_put', 'start_recording', 'stop_recording'}
 
-    def healthy():
+    last_unhealthy_reason = None
+
+    def health_reason():
         if not camera.is_ready:
-            return False
+            details = []
+            for serial, worker in camera.cameras.items():
+                state = (f'alive={worker.is_alive()} ready={worker.ready_event.is_set()} '
+                         f'recorder_alive={worker.video_recorder.is_alive()} '
+                         f'exitcode={worker.exitcode}')
+                if worker.error_reader.poll():
+                    state += '\\n' + worker.error_reader.recv()
+                details.append(f'{serial}: {state}')
+            return 'MVS worker/recorder is not ready; ' + '; '.join(details)
         # An SDK call can hang after startup while the process remains alive.
         # Do not keep serving an old frame as a healthy observation in that case.
-        latest = camera.get()
-        for frame in latest.values():
+        try:
+            latest = camera.get()
+        except Exception as exc:
+            return f'Cannot read latest MVS frame: {exc!r}'
+        now = time.time()
+        for index, frame in latest.items():
             stamp = float(frame.get('camera_receive_timestamp', frame['timestamp']))
-            if not math.isfinite(stamp) or time.time() - stamp > max_frame_age:
-                return False
-        return True
+            age = now - stamp
+            if not math.isfinite(stamp) or age > max_frame_age:
+                return (f'MVS frame {index} is stale: age={age:.3f}s '
+                        f'(limit={max_frame_age:.3f}s)')
+        return None
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(address)
@@ -265,8 +281,16 @@ def serve(camera, address, parent_pid, max_frame_age=5.0):
             try:
                 conn, _ = listener.accept()
             except socket.timeout:
-                if not healthy():
-                    raise RuntimeError('Camera/recorder stopped or frames became stale')
+                # A short USB/SDK stall must not kill the only camera service.
+                # Continue polling so a later frame can restore service without
+                # requiring the operator to restart the whole deployment.
+                reason = health_reason()
+                if reason != last_unhealthy_reason:
+                    if reason is None and last_unhealthy_reason is not None:
+                        print('MVS service recovered: fresh frames resumed', flush=True)
+                    elif reason is not None:
+                        print(f'MVS service temporarily unhealthy: {reason}', flush=True)
+                    last_unhealthy_reason = reason
                 continue
             with conn:
                 conn.settimeout(5)
@@ -276,10 +300,11 @@ def serve(camera, address, parent_pid, max_frame_age=5.0):
                     if method == 'stop':
                         stopping, result = True, None
                     elif method == 'is_ready':
-                        result = healthy()
+                        result = health_reason() is None
                     elif method in allowed:
-                        if not healthy():
-                            raise RuntimeError('Camera/recorder stopped or frames became stale')
+                        reason = health_reason()
+                        if reason is not None:
+                            raise RuntimeError(reason)
                         result = getattr(camera, method)(**kwargs)
                     else:
                         raise ValueError(f'Unsupported camera operation: {method}')

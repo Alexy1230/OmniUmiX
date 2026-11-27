@@ -1,13 +1,16 @@
 """ PC-side OpenPI serialization and per-arm geometry; no hardware imports. """
 import os
+import json
+import time
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 from umi.real_world.gripper_calibration import width_to_rad_parameters
 
 
-def validate_hardware_config(robots, grippers):
-    """Check only arm counts and independent hardware routing."""
+def validate_hardware_config(robots, grippers, policy_config=None):
+    """Validate hardware routing and the startup requirements of the live policy."""
     if len(robots) not in (1, 2) or len(grippers) != len(robots):
         raise ValueError('Configure one or two robots and exactly one gripper per robot')
     endpoints = [(rc['robot_ip'], int(rc.get('robot_port', 4242))) for rc in robots]
@@ -22,11 +25,33 @@ def validate_hardware_config(robots, grippers):
     if len(set(ports)) != len(ports):
         raise ValueError('Custom grippers require separate serial ports')
 
+    policy_config = policy_config or {}
+    requires_homing = (
+        policy_config.get('protocol') == 'ftp1_umi'
+        and policy_config.get('tactile', {}).get('enabled', False)
+    )
+    if requires_homing:
+        for i, gripper in enumerate(grippers):
+            homing = gripper.get('homing')
+            if (gripper.get('gripper_type') != 'custom'
+                    or not isinstance(homing, dict) or homing.get('enabled') is not True):
+                raise ValueError(
+                    f'grippers[{i}]: FTP1 tactile deployment requires a custom gripper with '
+                    'homing.enabled: true. Use the gripper homing block from '
+                    'example/eval_ftp1_sort_diff.yaml.'
+                )
+
 
 def policy_options(config, num_robots):
     """Choose the wire keys from robot count; every arm block follows list order."""
     if num_robots not in (1, 2):
         raise ValueError('Configure one or two robots')
+    if config.get('protocol') == 'ftp1_umi':
+        if config.get('action_is_relative', False) is not False:
+            raise ValueError('FTP1 returns absolute actions; use action_is_relative: false')
+        if num_robots != 1:
+            raise ValueError('The sort_diff checkpoint requires one RIGHT arm')
+
     default_image_keys = (['observation/image'] if num_robots == 1 else
                           ['observation/image_right', 'observation/image_left'])
     if 'action_is_relative' in config and not isinstance(config['action_is_relative'], bool):
@@ -161,7 +186,14 @@ class PolicyClient:
     def __init__(self, server_url, prompt, timeout=60.0, num_robots=1, policy_config=None):
         from websockets.sync.client import connect
         from umi.common import openpi_msgpack_numpy
-        self.options = policy_options(policy_config or {}, num_robots)
+        self.settings = dict(policy_config or {})
+        self.options = policy_options(self.settings, num_robots)
+        self.protocol = self.settings.get('protocol', 'openpi')
+        self.tactile = None
+        self.last_response = self.last_finger_force = self.last_tactile = None
+        self.request_id = 0
+        self.response_log = None
+        self.input_recorder = None
         self.num_robots, self.prompt, self.timeout = num_robots, prompt, timeout
         if not server_url or server_url.startswith(('http://', 'https://')):
             raise ValueError('Set a ws:// or wss:// OpenPI server URL')
@@ -175,15 +207,62 @@ class PolicyClient:
             message = self.ws.recv(timeout=timeout)
             self.metadata = self.codec.unpackb(message)
             keys = list(self.metadata) if isinstance(self.metadata, dict) else type(self.metadata).__name__
+            if self.protocol == 'ftp1_umi':
+                if (not isinstance(self.metadata, dict)
+                        or self.metadata.get('action_type') != 'tcp_pose9_gripper'
+                        or self.metadata.get('protocol', 'ftp1_umi') != 'ftp1_umi'):
+                    raise ValueError('Expected an FTP1 UMI server handshake; do not use a legacy OpenPI proprio server')
+                if not isinstance(self.metadata, dict) or self.metadata.get('is_relative') is not False:
+                    raise ValueError('FTP1 server must advertise absolute actions (is_relative=false)')
+                if self.options != policy_options({}, num_robots):
+                    raise ValueError('FTP1 uses canonical image and current_tcp_pose9_gripper keys')
+                if self.metadata.get('num_robots', num_robots) != num_robots:
+                    raise ValueError('Server arm count does not match the configured hardware')
+            tactile = dict(self.settings.get('tactile', {}))
+            if self.metadata.get('use_tactile_input') is True and not tactile.get('enabled', False):
+                raise ValueError('This checkpoint requires policy.tactile.enabled: true')
+            if tactile.get('enabled', False):
+                if num_robots != 1:
+                    raise ValueError('Current tactile server maps two fingers of the right arm only')
+                from umi.real_world.xense_capture import XenseCapture
+                if self.settings.get('capture_dir') and not tactile.get('runtime_directory'):
+                    tactile['runtime_directory'] = str(Path(self.settings['capture_dir']).expanduser().resolve()/'xense_runtime')
+                self.tactile = XenseCapture(tactile).start()
+            output = self.settings.get('capture_dir')
+            if output:
+                path = Path(output).expanduser().resolve()
+                path.mkdir(parents=True, exist_ok=True)
+                self.response_log = (path / 'policy_responses.jsonl').open('a', buffering=1)
+                if self.settings.get('save_tactile_images', True):
+                    from umi.real_world.policy_input_recorder import PolicyInputRecorder
+                    self.input_recorder = PolicyInputRecorder(path/'policy_inputs')
+                    print('[Capture] Enabled for this CLIENT run: every inference saves raw Difference '
+                          'and the exact 224x224 tactile request images; no separate script is needed.', flush=True)
         except BaseException:
             self.close()
             raise
         print(f'OpenPI connected; {num_robots} arm(s); metadata keys: {keys}')
 
     def close(self):
-        if self.ws is not None:
+        save_error = None
+        if getattr(self, 'input_recorder', None) is not None:
+            try:
+                self.input_recorder.close()
+            except Exception as error:
+                save_error = error
+            self.input_recorder = None
+        if getattr(self, 'tactile', None) is not None:
+            self.tactile.close()
+            self.tactile = None
+        if getattr(self, 'response_log', None) is not None:
+            self.response_log.close()
+            self.response_log = None
+        self.input_recorder = None
+        if getattr(self, 'ws', None) is not None:
             self.ws.close()
             self.ws = None
+        if save_error is not None:
+            raise save_error
 
     def build_payload(self, images, state):
         if isinstance(images, np.ndarray) and images.ndim == 3:
@@ -201,11 +280,26 @@ class PolicyClient:
             if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
                 raise ValueError('Images must be HWC uint8 RGB')
             payload[key] = image
+        if getattr(self, 'tactile', None) is not None:
+            self.last_tactile = self.tactile.read()
+            for side in ('left', 'right'):
+                # The unchanged server performs the same cv2 INTER_LINEAR resize.
+                # Sending 224 here makes its resize a no-op and avoids 700x400 network payloads.
+                import cv2
+                payload[f'observation/tactile_{side}_difference'] = cv2.resize(
+                    self.last_tactile[side]['image_rgb'], (224, 224), interpolation=cv2.INTER_LINEAR)
         return payload
 
     def call_server(self, images, state):
         # Fail visibly on contract/connection errors; never silently send one arm's output to both.
-        self.ws.send(self.packer.pack(self.build_payload(images, state)))
+        payload = self.build_payload(images, state)
+        request_started_at = time.time()
+        request_id = getattr(self, 'request_id', 0) + 1
+        if getattr(self, 'input_recorder', None) is not None:
+            self.input_recorder.submit(request_id, payload, self.last_tactile, self.settings,
+                                       phase=getattr(self, 'capture_phase', 'policy'),
+                                       observation_timestamp=getattr(self, 'observation_timestamp', None))
+        self.ws.send(self.packer.pack(payload))
         message = self.ws.recv(timeout=self.timeout)
         if isinstance(message, str):
             raise RuntimeError(f'OpenPI server error: {message}')
@@ -220,4 +314,29 @@ class PolicyClient:
         if action.ndim == 1:
             action = action[None]
         unpack_actions(action, self.num_robots)
+        self.last_response = result
+        force = result.get('finger_force') if isinstance(result, dict) else None
+        self.last_finger_force = None
+        if force is not None:
+            force = np.asarray(force, dtype=np.float32)
+            if force.shape != (len(action), 2, 3) or not np.isfinite(force).all():
+                raise ValueError(f'Expected finite finger_force[{len(action)},2,3], got {force.shape}')
+            self.last_finger_force = force
+        elif isinstance(self.metadata, dict) and self.metadata.get('predict_finger_force') is True:
+            raise ValueError('Force checkpoint omitted finger_force in its reply')
+        self.request_id = request_id
+        if getattr(self, 'response_log', None) is not None:
+            measured = getattr(self, 'last_tactile', None)
+            self.response_log.write(json.dumps(dict(
+                request_id=self.request_id, request_started_at=request_started_at, received_at=time.time(),
+                input_directory=(str(self.input_recorder.directory/f'request_{self.request_id:06d}')
+                                 if getattr(self, 'input_recorder', None) is not None else None),
+                reference=np.asarray(state).tolist(), actions=action.tolist(),
+                finger_force=None if force is None else force.tolist(),
+                measured=None if measured is None else {side: {
+                    key: value.tolist() if isinstance(value, np.ndarray) else value
+                    for key, value in sample.items() if key != 'image_rgb'
+                } for side, sample in measured.items()},
+                note='Full predicted chunk, not a record of executed slots; SDK force units, left finger then right.'
+            )) + '\n')
         return action

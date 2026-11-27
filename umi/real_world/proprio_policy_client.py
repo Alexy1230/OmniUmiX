@@ -36,6 +36,9 @@ class ProprioPolicyClient(PolicyClient):
         self.reset_episode()
 
     def validate_contract(self):
+        if getattr(self, 'protocol', None) == 'ftp1_umi':
+            self.ftp1_current_state = True
+            return
         keys = image_keys(self.num_robots)
         if self.options['image_keys'] != keys or self.options['state_key'] != 'current_tcp_pose9_gripper':
             raise ValueError('Use canonical proprio image/state keys; remove custom image_keys/state_key')
@@ -71,6 +74,8 @@ class ProprioPolicyClient(PolicyClient):
 
     def build_payload(self, images, state):
         payload = super().build_payload(images, state)
+        if getattr(self, 'ftp1_current_state', False):
+            return payload
         if self.history is None or not np.allclose(self.history[-1], state, atol=1e-5, rtol=0):
             raise ValueError('History must be set and end at the request TCP state')
         keys = image_keys(self.num_robots)

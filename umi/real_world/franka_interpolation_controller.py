@@ -81,6 +81,33 @@ class FrankaInterface:
         self.server.close()
 
 
+def _is_no_controller_error(exc):
+    """Whether the robot-side Polymetis server has not installed a policy yet."""
+    text = ' '.join(str(getattr(exc, name, '')) for name in (
+        'msg', 'traceback', 'human_msg', 'human_traceback', 'name'
+    ))
+    return 'no controller running' in f'{text} {exc}'.lower()
+
+
+def wait_for_cartesian_controller(robot, flange_pose, timeout_s=5.0):
+    """Wait until the just-started remote impedance policy accepts a target."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            robot.update_desired_ee_pose(flange_pose)
+            return
+        except zerorpc.exceptions.RemoteError as exc:
+            if not _is_no_controller_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    'Franka cartesian controller did not become ready within '
+                    f'{timeout_s:g}s. Check/restart the robot-side Polymetis '
+                    'controller service before retrying.'
+                ) from exc
+            time.sleep(0.05)
+
+
 class FrankaInterpolationController(mp.Process):
     """
     To ensure sending command to the robot with predictable latency
@@ -308,6 +335,13 @@ class FrankaInterpolationController(mp.Process):
                 Kx=self.Kx,
                 Kxd=self.Kxd
             )
+            # start_cartesian_impedance returns before Polymetis necessarily
+            # installs the policy. Verify the first target is accepted before
+            # entering the 200 Hz command loop.
+            initial_flange_pose = mat_to_pose(
+                pose_to_mat(curr_pose) @ robot.tx_tcp_flange
+            )
+            wait_for_cartesian_controller(robot, initial_flange_pose)
 
             t_start = time.monotonic()
             iter_idx = 0
@@ -412,7 +446,14 @@ class FrankaInterpolationController(mp.Process):
             # manditory cleanup
             # terminate
             print('\n\n\n\nterminate_current_policy\n\n\n\n\n')
-            robot.terminate_current_policy()
+            try:
+                robot.terminate_current_policy()
+            except zerorpc.exceptions.RemoteError as exc:
+                # A failed startup can leave no policy to terminate. Preserve
+                # the original failure instead of emitting a misleading second
+                # traceback during process cleanup.
+                if not _is_no_controller_error(exc):
+                    raise
             del robot
             self.ready_event.set()
 

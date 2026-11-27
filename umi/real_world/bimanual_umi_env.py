@@ -339,20 +339,39 @@ class BimanualUmiEnv:
         return ready_flag
     
     def start(self, wait=True):
-        # Validate the MVS SDK and first frame before starting robot motion workers.
-        self.camera.start(wait=self.camera_startup_first)
-        for robot in self.robots:
-            robot.start(wait=False)
-        for gripper, gc in zip(self.grippers, self.grippers_config):
-            if gc.get('gripper_type', 'wsg') == 'custom':
-                gripper.start()
-            else:
-                gripper.start(wait=False)
-
-        if self.multi_cam_vis is not None:
-            self.multi_cam_vis.start(wait=False)
-        if wait:
-            self.start_wait()
+        # Tactile CALIBRATE happens in the client before this environment starts.
+        # Validate camera -> mechanically home grippers -> start arm workers.
+        started = []
+        try:
+            started.append((self.camera, False))
+            self.camera.start(wait=self.camera_startup_first)
+            for gripper, gc in zip(self.grippers, self.grippers_config):
+                custom = gc.get('gripper_type', 'wsg') == 'custom'
+                started.append((gripper, custom))
+                if custom:
+                    kwargs = {}
+                    if 'reset_zero' in gc:
+                        kwargs['reset_zero'] = gc['reset_zero']
+                    if gc.get('homing', {}).get('enabled', False):
+                        kwargs['homing'] = gc['homing']
+                    gripper.start(**kwargs)
+                else:
+                    gripper.start(wait=False)
+            for robot in self.robots:
+                started.append((robot, False))
+                robot.start(wait=False)
+            if self.multi_cam_vis is not None:
+                started.append((self.multi_cam_vis, False))
+                self.multi_cam_vis.start(wait=False)
+            if wait:
+                self.start_wait()
+        except BaseException:
+            for worker, custom in reversed(started):
+                try:
+                    worker.stop() if custom else worker.stop(wait=True)
+                except Exception:
+                    pass
+            raise
 
     def stop(self, wait=True):
         try:
@@ -415,7 +434,15 @@ class BimanualUmiEnv:
         #     print(f"robot {i} ready:", robot.is_ready)
         # print("env ready:", self.is_ready)
         # print("======================================\n")
-        assert self.is_ready
+        if not self.is_ready:
+            camera_ready = self.camera.is_ready
+            robot_ready = [robot.is_ready for robot in self.robots]
+            raise RuntimeError(
+                'Hardware environment is no longer ready: '
+                f'camera={camera_ready}, robots={robot_ready}. '
+                'For an MVS camera failure, inspect the MVS service diagnostic '
+                'printed above and verify USB/power before restarting.'
+            )
 
         # get data
         # 60 Hz, camera_calibrated_timestamp

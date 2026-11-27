@@ -44,9 +44,40 @@ def warmup_requests(env, infer, read_keys, count=2):
     return "q" not in read_keys()
 
 
+def wait_initial_gripper_opening(env, grippers_config, timeout=10.0):
+    """Wait for configured custom-gripper targets before warmup/another episode."""
+    targets = [(i, float(gc['initial_position'])) for i,gc in enumerate(grippers_config)
+               if gc.get('gripper_type', 'wsg') == 'custom' and 'initial_position' in gc]
+    if not targets:
+        return
+    deadline = time.monotonic() + timeout
+    stable, previous_stamp = {i: 0 for i,_ in targets}, {}
+    while time.monotonic() < deadline:
+        for i, target in targets:
+            grip = env.grippers[i]
+            if grip.thread is not None and not grip.thread.is_alive():
+                raise RuntimeError(f'gripper{i}: control thread stopped while opening')
+            state = grip.get_all_state()
+            stamps = state.get('gripper_timestamp', ())
+            if not len(stamps):
+                continue
+            stamp = float(stamps[-1])
+            if stamp == previous_stamp.get(i) or time.time()-stamp > 1.0:
+                continue
+            previous_stamp[i] = stamp
+            width = float(grip.get_current_gripper_width())
+            stable[i] = stable[i]+1 if np.isfinite(width) and abs(width-target) <= 0.001 else 0
+        if all(stable[i] >= 3 for i,_ in targets):
+            print('[Gripper init] Initial opening confirmed by feedback.', flush=True)
+            return
+        time.sleep(0.02)
+    raise TimeoutError('Initial gripper opening not reached; model inference has not started')
+
+
 def warmup_pi(env, client, resolution, scales, options, read_keys):
     from umi.real_world.bimanual_policy import build_observation
 
+    wait_initial_gripper_opening(env, env.grippers_config)
     proprio = hasattr(client, "set_history")
 
     def infer(obs):
@@ -57,11 +88,15 @@ def warmup_pi(env, client, resolution, scales, options, read_keys):
             previous, history = paired_history(obs, resolution, scales, options, count=len(scales))
             timestamps = obs["timestamp"]
             client.set_history(previous, history, float(timestamps[0]), float(timestamps[-1]))
+        client.observation_timestamp = float(obs['timestamp'][-1])
         client.call_server(images, state)
 
+    previous_phase = getattr(client, 'capture_phase', 'policy')
+    client.capture_phase = 'warmup'
     try:
         return warmup_requests(env, infer, read_keys)
     finally:
+        client.capture_phase = previous_phase
         if proprio:
             client.reset_episode()
 

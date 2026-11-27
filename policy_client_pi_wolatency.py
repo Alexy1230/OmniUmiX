@@ -245,6 +245,8 @@ def restore_initial_gripper_opening(env, grippers_config):
             else:
                 env.grippers[i].schedule_waypoint(pos=width, target_time=time.time() + 0.5)
             print(f'gripper{i}: initial opening requested {width*1000:.1f} mm (zero unchanged).', flush=True)
+    from umi.real_world.client_deployment import wait_initial_gripper_opening
+    wait_initial_gripper_opening(env, grippers_config)
 
 
 # ============ 主函数 ============
@@ -278,6 +280,8 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     # Load robot config
     robot_config_data = yaml.safe_load(open(os.path.expanduser(robot_config), 'r'))
     policy_config = dict(robot_config_data.get('policy', {}))
+    policy_config['capture_dir'] = output
+    policy_config['gripper_calibration'] = [gc.get('width_to_rad') for gc in robot_config_data['grippers']]
     history_gap = None
     if PROPRIOCEPTION:
         history_gap = float(policy_config.get('proprio_history_seconds', 0.1))
@@ -307,7 +311,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
     from umi.real_world.mvs_camera_config import camera_configs_from_yaml
     cameras_config = camera_configs_from_yaml(robot_config_data)
     num_robots = len(robots_config)
-    validate_hardware_config(robots_config, grippers_config)
+    validate_hardware_config(robots_config, grippers_config, policy_config)
     options = policy_options(policy_config, num_robots)
     hardware_to_model_gripper_scale, model_to_hardware_gripper_scale = configure_gripper_conversion(
         grippers_config, hardware_to_model_gripper_scale, model_to_hardware_gripper_scale, options)
@@ -432,8 +436,21 @@ def main(server_url, prompt, request_timeout, output, robot_config,
                 print("\nWaiting for start command...")
                 print('C: start here; R: return to initial joints; Q: quit. Terminal input requires Enter.', flush=True)
 
+                last_idle_camera_error = None
                 while True:
-                    obs = env.get_obs()
+                    try:
+                        obs = env.get_obs()
+                    except RuntimeError as exc:
+                        # Before C no policy action can be running. Let a
+                        # transient camera/USB stall recover instead of
+                        # terminating the prepared deployment session.
+                        error = str(exc)
+                        if error != last_idle_camera_error:
+                            print(f'[Waiting] Camera unavailable; retrying: {error}', flush=True)
+                            last_idle_camera_error = error
+                        time.sleep(0.25)
+                        continue
+                    last_idle_camera_error = None
                     vis_img = obs[f'camera{vis_camera_idx}_rgb'][-1].copy()
 
                     # show states
@@ -509,6 +526,7 @@ def main(server_url, prompt, request_timeout, output, robot_config,
 
                         # Server-client communication
                         s = time.time()
+                        policy_client.observation_timestamp = float(obs['timestamp'][-1])
                         raw_action = policy_client.call_server(images, current_state)
                         response_received_at = time.time()
 

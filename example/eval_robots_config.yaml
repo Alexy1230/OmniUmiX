@@ -24,7 +24,8 @@
   # gripper configurations, 0->right 1->left
   "grippers": [
     {
-      "gripper_type": "custom",  # Use custom gripper (gripper_controller_1_14.py)
+      "gripper_type": "custom",
+      "homing": {"enabled": true, "torque_nm": -0.05, "timeout_s": 2.0, "velocity_threshold_rad_s": 0.05, "stall_samples": 10, "min_duration_s": 0.2},  # Use custom gripper (gripper_controller_1_14.py)
       "port1": "/dev/ttyUSB1",   # Serial port for motor 1
       "motor1_id": 2,            # Motor 1 ID
       "mode": "single",          # "single" or "dual"

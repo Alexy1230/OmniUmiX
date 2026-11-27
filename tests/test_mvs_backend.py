@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from pathlib import Path
 import time
 import multiprocessing as mp
+import threading
 import sys
 import importlib
 from multiprocessing.managers import SharedMemoryManager
@@ -12,7 +13,7 @@ import av
 import numpy as np
 import pytest
 
-from umi.real_world.mvs_capture import MvsCapture, crop_with_black_padding
+from umi.real_world.mvs_capture import MvsCapture, MvsFrameTimeout, crop_with_black_padding
 from umi.real_world.mvs_camera_config import normalize_mvs_configs, MvsImageTransform, resize_image
 from umi.real_world.mvs_camera import MvsCamera, MultiMvsCamera
 
@@ -100,6 +101,29 @@ def test_sdk_selection_pixels_rotation_and_release():
     assert calls[-1] == 'finalize'
     assert [call[0] for call in calls if isinstance(call, tuple)][-3:] == [
         'MV_CC_StopGrabbing', 'MV_CC_CloseDevice', 'MV_CC_DestroyHandle']
+
+
+def test_mvs_camera_retries_one_sdk_frame_timeout():
+    camera = object.__new__(MvsCamera)
+    camera.mvs_config = {'frame_timeout_ms': 1}
+    camera.dev_video_path = 'TEST'
+    camera.stop_event = threading.Event()
+    image = np.full((2, 2, 3), 7, dtype=np.uint8)
+
+    class Capture:
+        calls = 0
+
+        def read(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise MvsFrameTimeout('temporary timeout')
+            return image, 123.0
+
+    frame = np.empty_like(image)
+    result, received, captured = camera._read_capture(Capture(), frame)
+    assert result is frame
+    np.testing.assert_array_equal(frame, image)
+    assert received == captured == 123.0
 
 
 @pytest.mark.parametrize('failure', ['convert', 'MV_CC_OpenDevice', 'missing_serial'])
